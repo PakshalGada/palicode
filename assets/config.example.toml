@@ -1,0 +1,41 @@
+# palicode configuration
+# Location: ~/.config/palicode/config.toml (override with $PALICODE_CONFIG)
+
+[general]
+theme = "minimal-dark"
+approval_mode = "suggest" # suggest | auto-edit | full-auto
+log_level = "warn"        # error | warn | info | debug | trace
+# default_provider = "ollama"
+# default_model = "qwen3.5:9b"
+max_steps = 32
+# system_prompt = "You are palicode, a concise coding agent."
+
+[providers]
+# OpenCode Console (pay-as-you-go gateway). Set OPENCODE_API_KEY to enable.
+[[providers.list]]
+name = "opencode"
+type = "openai_compatible"
+base_url = "https://opencode.ai/inference/openai/v1"
+models_url = "https://opencode.ai/inference/v1/models"
+api_key_env = "OPENCODE_API_KEY"
+default_model = "deepseek-v4.1-flash"
+stream_usage = true
+
+# Ollama (local). OLLAMA_HOST overrides base_url, e.g. OLLAMA_HOST=127.0.0.1:11434
+[[providers.list]]
+name = "ollama"
+type = "openai_compatible"
+base_url = "http://localhost:11434/v1"
+default_model = "qwen3.5:9b"
+
+[tools]
+shell = "/bin/sh"
+shell_timeout_secs = 120
+max_output_bytes = 60000
+max_read_lines = 2000
+path_sandbox = true
+# sandbox_root = "/home/you/projects" # defaults to the working directory
+
+[tui]
+mouse = true
+vim_nav = true
