@@ -5,10 +5,11 @@
 
 pub mod fs;
 pub mod git;
-mod patch;
+pub mod patch;
 pub mod process;
 pub mod search;
 pub mod shell;
+pub mod task;
 
 use crate::config::ToolsConfig;
 use crate::util::path::{display_path, resolve_path};
@@ -22,7 +23,7 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 /// Shared, sandboxed execution context for tools.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
     pub cwd: PathBuf,
     /// `None` disables path sandboxing.
@@ -31,6 +32,22 @@ pub struct ToolContext {
     pub shell_timeout: Duration,
     pub max_output_bytes: usize,
     pub max_read_lines: usize,
+    /// Installed by the agent for the `task` tool.
+    pub subagent: Option<Arc<dyn task::SubagentRunner>>,
+}
+
+impl std::fmt::Debug for ToolContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolContext")
+            .field("cwd", &self.cwd)
+            .field("sandbox_root", &self.sandbox_root)
+            .field("shell", &self.shell)
+            .field("shell_timeout", &self.shell_timeout)
+            .field("max_output_bytes", &self.max_output_bytes)
+            .field("max_read_lines", &self.max_read_lines)
+            .field("subagent", &self.subagent.is_some())
+            .finish()
+    }
 }
 
 impl ToolContext {
@@ -70,6 +87,7 @@ impl ToolContext {
             shell_timeout: Duration::from_secs(config.shell_timeout_secs),
             max_output_bytes: config.max_output_bytes,
             max_read_lines: config.max_read_lines,
+            subagent: None,
         })
     }
 
@@ -87,13 +105,21 @@ impl ToolContext {
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
+    /// Unified diff produced by a mutating tool, for the Phase 3 diff pane.
+    pub diff: Option<String>,
 }
 
 impl ToolOutput {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            diff: None,
         }
+    }
+
+    pub fn with_diff(mut self, diff: impl Into<String>) -> Self {
+        self.diff = Some(diff.into());
+        self
     }
 }
 
@@ -116,7 +142,7 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Registry with every built-in Phase 1 tool.
+    /// Registry with every built-in tool.
     pub fn with_defaults() -> Self {
         let mut registry = Self::default();
         registry.register(fs::ReadFile);
@@ -129,7 +155,19 @@ impl ToolRegistry {
         registry.register(search::Glob);
         registry.register(git::GitStatus);
         registry.register(git::GitDiff);
+        registry.register(task::TaskTool);
         registry
+    }
+
+    /// Read-only subset for subagents: no mutations, no recursive `task`.
+    pub fn for_subagent(&self) -> Self {
+        let tools = self
+            .tools
+            .iter()
+            .filter(|(name, tool)| **name != "task" && tool.read_only())
+            .map(|(name, tool)| (*name, Arc::clone(tool)))
+            .collect();
+        Self { tools }
     }
 
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
@@ -247,10 +285,22 @@ mod tests {
             "glob",
             "git_status",
             "git_diff",
+            "task",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
         assert_eq!(registry.specs().len(), names.len());
+    }
+
+    #[test]
+    fn subagent_registry_is_read_only_and_not_recursive() {
+        let registry = ToolRegistry::with_defaults();
+        let subagent = registry.for_subagent();
+        assert!(subagent.get("read_file").is_some());
+        assert!(subagent.get("grep").is_some());
+        assert!(subagent.get("write_file").is_none());
+        assert!(subagent.get("run_shell").is_none());
+        assert!(subagent.get("task").is_none());
     }
 
     #[test]

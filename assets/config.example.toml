@@ -2,7 +2,7 @@
 # Location: ~/.config/palicode/config.toml (override with $PALICODE_CONFIG)
 
 [general]
-theme = "minimal-dark"
+theme = "mono-dark"
 approval_mode = "suggest" # suggest | auto-edit | full-auto
 log_level = "warn"        # error | warn | info | debug | trace
 # default_provider = "ollama"
@@ -11,7 +11,10 @@ max_steps = 32
 # system_prompt = "You are palicode, a concise coding agent."
 
 [providers]
-# OpenCode Console (pay-as-you-go gateway). Set OPENCODE_API_KEY to enable.
+# OpenCode Console (pay-as-you-go gateway).
+# Set OPENCODE_API_KEY, or press F2 in the TUI and paste a key. Stored keys live
+# in ~/.config/palicode/credentials.toml with mode 0600 and are never written to
+# config.toml. The environment variable takes precedence when both are set.
 [[providers.list]]
 name = "opencode"
 type = "openai_compatible"
@@ -35,6 +38,19 @@ max_output_bytes = 60000
 max_read_lines = 2000
 path_sandbox = true
 # sandbox_root = "/home/you/projects" # defaults to the working directory
+
+[permissions]
+# Rules use globs for the tool name and an optional subject (command/path/prompt).
+# Built-in safety denies always apply. A matching deny wins; otherwise the first
+# matching allow/ask rule applies.
+# [[permissions.rules]]
+# tool = "run_shell"
+# pattern = "git push*"
+# action = "ask"        # allow | ask | deny
+# [[permissions.rules]]
+# tool = "write_file"
+# pattern = "**/.env*"
+# action = "deny"
 
 [tui]
 mouse = true

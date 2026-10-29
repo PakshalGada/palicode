@@ -1,14 +1,16 @@
 //! REPL and one-shot (`run`) front-ends.
 
 use crate::agent::AgentSession;
+use crate::approval::NonInteractiveApprover;
+use crate::cli::input::{PromptApprover, SharedInput};
+use crate::cli::plan;
 use crate::cli::print::{Mode, Printer};
-use crate::config::Config;
+use crate::config::{ApprovalMode, Config};
 use crate::provider;
 use crate::tools::{ToolContext, ToolRegistry};
 use anyhow::{Context, Result, bail};
 use std::io::{IsTerminal, Write};
-use tokio::io::AsyncBufReadExt;
-use tokio::io::BufReader;
+use std::sync::Arc;
 
 /// Build a session by resolving a provider and model.
 pub async fn build_session(
@@ -36,24 +38,23 @@ pub async fn repl(
 ) -> Result<()> {
     let mut session =
         build_session(&config, &ctx, provider_name.as_deref(), model.as_deref()).await?;
+    let input = SharedInput::new();
+    session.set_approver(Arc::new(PromptApprover::new(input.clone())));
     let mut printer = Printer::new(Mode::Repl);
     print_banner(&session, &ctx);
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
-    let mut line = String::new();
 
+    let mut line = String::new();
     loop {
         if std::io::stdin().is_terminal() {
             if std::io::stdout().is_terminal() {
-                print!("\x1b[36m❯\x1b[0m ");
+                print!("\x1b[1m❯\x1b[0m ");
             } else {
                 print!("> ");
             }
             let _ = std::io::stdout().flush();
         }
 
-        line.clear();
-        let read = reader
+        let read = input
             .read_line(&mut line)
             .await
             .context("cannot read stdin")?;
@@ -64,13 +65,14 @@ pub async fn repl(
             break;
         }
 
-        let input = line.trim();
-        if input.is_empty() {
+        let command_line = line.trim();
+        if command_line.is_empty() {
             continue;
         }
 
-        if input.starts_with('/') {
-            let keep_going = handle_command(&mut session, &config, input, &mut printer).await;
+        if command_line.starts_with('/') {
+            let keep_going =
+                handle_command(&mut session, &config, &input, command_line, &mut printer).await;
             if !keep_going {
                 break;
             }
@@ -78,7 +80,7 @@ pub async fn repl(
         }
 
         if let Err(err) = session
-            .run_turn(input, &mut |event| printer.event(event))
+            .run_turn(command_line, &mut |event| printer.event(event))
             .await
         {
             printer.error(&format!("{err:#}"));
@@ -95,13 +97,39 @@ pub async fn run_once(
     provider_name: Option<String>,
     model: Option<String>,
     prompt: String,
+    plan_requested: bool,
 ) -> Result<()> {
     if prompt.trim().is_empty() {
         bail!("prompt must not be empty");
     }
     let mut session =
         build_session(&config, &ctx, provider_name.as_deref(), model.as_deref()).await?;
+    session.set_approver(Arc::new(NonInteractiveApprover::default()));
     let mut printer = Printer::new(Mode::Run);
+
+    if plan_requested {
+        let mut generated = plan::generate_plan(&session, &prompt, &mut printer).await?;
+        printer.info(&generated.render(None));
+
+        if session.approval_mode() != ApprovalMode::FullAuto {
+            bail!("plan approval is required to execute; re-run with --yes or --mode full-auto");
+        }
+
+        let selected: Vec<usize> = (0..generated.steps.len()).collect();
+        let outcome = crate::agent::executor::execute_plan(
+            &mut session,
+            &mut generated,
+            &selected,
+            &mut |event| printer.event(event),
+        )
+        .await?;
+        printer.finish();
+        if outcome.failed > 0 {
+            bail!("plan finished with {} failed step(s)", outcome.failed);
+        }
+        return Ok(());
+    }
+
     let result = session
         .run_turn(&prompt, &mut |event| printer.event(event))
         .await;
@@ -110,12 +138,38 @@ pub async fn run_once(
     Ok(())
 }
 
+/// Generate and print a plan without executing it.
+pub async fn plan_only(
+    config: Config,
+    ctx: ToolContext,
+    provider_name: Option<String>,
+    model: Option<String>,
+    task: String,
+    json: bool,
+) -> Result<()> {
+    if task.trim().is_empty() {
+        bail!("task must not be empty");
+    }
+    let session = build_session(&config, &ctx, provider_name.as_deref(), model.as_deref()).await?;
+    let plan = session
+        .planner()
+        .create(&task, &session.context().cwd, &session.registry().names())
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        print!("{}", plan.render(None));
+    }
+    Ok(())
+}
+
 fn print_banner(session: &AgentSession, ctx: &ToolContext) {
     let version = env!("CARGO_PKG_VERSION");
     println!(
-        "palicode {version}  provider={}  model={}",
+        "palicode {version}  provider={}  model={}  mode={}",
         session.provider().name(),
-        session.model()
+        session.model(),
+        session.approval_mode()
     );
     println!("endpoint: {}", session.provider().base_url());
     let sandbox = ctx
@@ -129,7 +183,7 @@ fn print_banner(session: &AgentSession, ctx: &ToolContext) {
         sandbox,
         session.registry().names().len()
     );
-    println!("/help for commands  ·  /quit to exit  ·  Ctrl-D to exit");
+    println!("/help for commands  ·  /plan <task> to plan  ·  /quit to exit");
     println!();
 }
 
@@ -137,10 +191,11 @@ fn print_banner(session: &AgentSession, ctx: &ToolContext) {
 async fn handle_command(
     session: &mut AgentSession,
     config: &Config,
-    input: &str,
+    input: &SharedInput,
+    command_line: &str,
     printer: &mut Printer,
 ) -> bool {
-    let mut parts = input.splitn(2, char::is_whitespace);
+    let mut parts = command_line.splitn(2, char::is_whitespace);
     let command = parts
         .next()
         .unwrap_or("")
@@ -154,6 +209,28 @@ async fn handle_command(
         "clear" => {
             session.reset();
             printer.info("history cleared");
+        }
+        "plan" => {
+            if argument.is_empty() {
+                printer.info("usage: /plan <task>");
+            } else if let Err(err) = plan::interactive(session, input, argument, printer).await {
+                printer.error(&format!("{err:#}"));
+            }
+        }
+        "mode" => {
+            if argument.is_empty() {
+                printer.info(&format!(
+                    "approval mode: {} (suggest | auto-edit | full-auto)",
+                    session.approval_mode()
+                ));
+            } else if let Some(mode) = ApprovalMode::parse(argument) {
+                session.set_approval_mode(mode);
+                printer.info(&format!("approval mode set to {mode}"));
+            } else {
+                printer.error(&format!(
+                    "invalid approval mode '{argument}' (suggest | auto-edit | full-auto)"
+                ));
+            }
         }
         "models" => match session.provider().list_models().await {
             Ok(models) if models.is_empty() => printer.info("provider advertises no models"),
@@ -201,7 +278,8 @@ async fn handle_command(
             for name in session.registry().names() {
                 if let Some(tool) = session.registry().get(name) {
                     let description = tool.description().lines().next().unwrap_or("");
-                    println!("  {name:<14} {description}");
+                    let kind = if tool.read_only() { "ro" } else { "rw" };
+                    println!("  {name:<14} [{kind}] {description}");
                 }
             }
         }
@@ -227,6 +305,8 @@ fn print_help() {
     println!(
         "\
 Commands:
+  /plan <task>       Generate a plan, review/edit/approve it, then execute
+  /mode [mode]       Show or set approval mode (suggest | auto-edit | full-auto)
   /help              Show this help
   /models            List models advertised by the current provider
   /model <id>        Switch model
@@ -238,6 +318,7 @@ Commands:
   /history           Show message count
   /quit              Exit (also Ctrl-D)
 
-Everything else is sent to the model. Tool calls are executed automatically."
+Plan review: a=all, n=none, 1 2 3=toggle, e N text, r N M, d N, y=execute, q=cancel.
+Everything else is sent to the model. Mutating tools follow the approval mode."
     );
 }

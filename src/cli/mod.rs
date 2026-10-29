@@ -1,9 +1,11 @@
 //! CLI entry point and command dispatch.
 
+mod input;
+mod plan;
 mod print;
 mod session;
 
-use crate::config::Config;
+use crate::config::{ApprovalMode, Config};
 use crate::provider;
 use crate::tools::{ToolContext, ToolRegistry};
 use anyhow::{Context, Result, bail};
@@ -36,6 +38,14 @@ struct Cli {
     #[arg(long, global = true, value_name = "MODEL")]
     model: Option<String>,
 
+    /// Approval mode: suggest | auto-edit | full-auto
+    #[arg(long, global = true, value_name = "MODE", value_parser = parse_approval_mode)]
+    mode: Option<ApprovalMode>,
+
+    /// Auto-approve plans and mutating tools (equivalent to --mode full-auto)
+    #[arg(long, global = true)]
+    yes: bool,
+
     /// Increase log verbosity (-v = debug, -vv = trace)
     #[arg(short = 'v', long, global = true, action = ArgAction::Count)]
     verbose: u8,
@@ -49,6 +59,9 @@ enum Command {
     Repl,
     /// Run one prompt headlessly and exit
     Run {
+        /// Generate a plan first (requires --yes or --mode full-auto to execute)
+        #[arg(long)]
+        plan: bool,
         /// Prompt text. If omitted, stdin is read (when piped).
         #[arg(
             value_name = "PROMPT",
@@ -56,6 +69,19 @@ enum Command {
             allow_hyphen_values = true
         )]
         prompt: Vec<String>,
+    },
+    /// Generate and print a plan without executing it
+    Plan {
+        /// Print the plan as JSON
+        #[arg(long)]
+        json: bool,
+        /// Task text. If omitted, stdin is read (when piped).
+        #[arg(
+            value_name = "TASK",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        task: Vec<String>,
     },
     /// List configured providers and their models
     Models,
@@ -85,18 +111,29 @@ pub async fn run() -> Result<()> {
     let command = cli.command.unwrap_or(Command::Tui);
     // `config --init` must work before the file exists.
     let config_required = cli.config.is_some() && !matches!(&command, Command::Config { .. });
-    let config = Config::load_from_optional(&config_path, config_required)?;
+    let mut config = Config::load_from_optional(&config_path, config_required)?;
+    if cli.yes {
+        config.general.approval_mode = ApprovalMode::FullAuto;
+    } else if let Some(mode) = cli.mode {
+        config.general.approval_mode = mode;
+    }
     init_logging(&config, cli.verbose);
     let ctx = ToolContext::from_config(&cwd, &config.tools)?;
 
     match command {
-        Command::Tui => tui_placeholder(),
+        Command::Tui => {
+            crate::ui::run(config, config_path, ctx, cli.provider, cli.model).await?;
+        }
         Command::Repl => {
             session::repl(config, ctx, cli.provider, cli.model).await?;
         }
-        Command::Run { prompt } => {
+        Command::Run { plan, prompt } => {
             let prompt = collect_prompt(prompt).await?;
-            session::run_once(config, ctx, cli.provider, cli.model, prompt).await?;
+            session::run_once(config, ctx, cli.provider, cli.model, prompt, plan).await?;
+        }
+        Command::Plan { json, task } => {
+            let task = collect_prompt(task).await?;
+            session::plan_only(config, ctx, cli.provider, cli.model, task, json).await?;
         }
         Command::Models => {
             list_models(&config).await;
@@ -107,6 +144,12 @@ pub async fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_approval_mode(value: &str) -> std::result::Result<ApprovalMode, String> {
+    ApprovalMode::parse(value).ok_or_else(|| {
+        format!("invalid approval mode '{value}' (expected suggest, auto-edit, or full-auto)")
+    })
 }
 
 fn resolve_cwd(given: Option<&Path>) -> Result<PathBuf> {
@@ -140,13 +183,6 @@ fn init_logging(config: &Config, verbose: u8) {
         .with_ansi(std::io::stderr().is_terminal())
         .compact()
         .try_init();
-}
-
-fn tui_placeholder() {
-    println!(
-        "The palicode TUI is not implemented yet (Phase 3).\n\
-         Try `palicode repl` for an interactive session, or `palicode run \"...\"` for one task."
-    );
 }
 
 async fn collect_prompt(parts: Vec<String>) -> Result<String> {

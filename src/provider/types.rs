@@ -1,7 +1,8 @@
 //! Shared provider request/response types.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::pin::Pin;
@@ -176,4 +177,23 @@ pub trait Provider: Send + Sync {
 
     async fn chat_stream(&self, request: ChatRequest) -> Result<ProviderStream>;
     async fn list_models(&self) -> Result<Vec<String>>;
+
+    /// Collect a full (non-incremental) response. Used by the planner.
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let mut stream = self.chat_stream(request).await?;
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            match event? {
+                StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::ReasoningDelta(_) => {}
+                StreamEvent::Finished(mut response) => {
+                    if response.content.is_empty() {
+                        response.content = text;
+                    }
+                    return Ok(response);
+                }
+            }
+        }
+        bail!("provider stream ended without a response")
+    }
 }

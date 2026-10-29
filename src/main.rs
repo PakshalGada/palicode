@@ -1,8 +1,10 @@
 //! palicode - minimal, shortcut-driven terminal coding agent.
 
 mod agent;
+mod approval;
 mod cli;
 mod config;
+mod credentials;
 mod event;
 mod provider;
 mod state;

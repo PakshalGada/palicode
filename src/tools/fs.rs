@@ -168,6 +168,17 @@ impl Tool for WriteFile {
             bail!("{} is a directory", ctx.display(&path));
         }
         let existed = path.exists();
+        let display = ctx.display(&path);
+        let previous = if existed {
+            match tokio::fs::read(&path).await {
+                Ok(bytes) if bytes.len() <= 2 * 1024 * 1024 && !looks_binary(&bytes) => {
+                    String::from_utf8(bytes).ok()
+                }
+                _ => None,
+            }
+        } else {
+            Some(String::new())
+        };
 
         if let Some(parent) = path.parent()
             && !parent.exists()
@@ -186,16 +197,22 @@ impl Tool for WriteFile {
 
         tokio::fs::write(&path, content.as_bytes())
             .await
-            .with_context(|| format!("cannot write {}", ctx.display(&path)))?;
+            .with_context(|| format!("cannot write {}", display))?;
 
         let lines = content.lines().count();
-        Ok(ToolOutput::text(format!(
+        let output = ToolOutput::text(format!(
             "{} {} ({} bytes, {} lines)",
             if existed { "Overwrote" } else { "Created" },
-            ctx.display(&path),
+            display,
             content.len(),
             lines
-        )))
+        ));
+        Ok(match previous {
+            Some(previous) if content.len() <= 512 * 1024 => {
+                output.with_diff(unified_diff(&previous, content, &display, !existed))
+            }
+            _ => output,
+        })
     }
 }
 
@@ -293,11 +310,7 @@ impl Tool for EditFile {
             }
         }
 
-        let unified = diff
-            .unified_diff()
-            .context_radius(3)
-            .header(&format!("a/{display}"), &format!("b/{display}"))
-            .to_string();
+        let unified = unified_diff(&original, &updated, &display, false);
 
         let mut output = format!(
             "Edited {display} (+{added} -{removed}, {occurrences} match{})\n{}",
@@ -307,7 +320,7 @@ impl Tool for EditFile {
         if output.len() > ctx.max_output_bytes {
             output = truncate_middle(&output, ctx.max_output_bytes);
         }
-        Ok(ToolOutput::text(output))
+        Ok(ToolOutput::text(output).with_diff(unified))
     }
 }
 
@@ -465,12 +478,26 @@ impl Tool for ApplyPatch {
             }
         }
 
-        Ok(ToolOutput::text(report))
+        Ok(ToolOutput::text(report).with_diff(patch_text))
     }
 }
 
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
+}
+
+fn unified_diff(old: &str, new: &str, display: &str, created: bool) -> String {
+    let old_header = if created {
+        "/dev/null".to_string()
+    } else {
+        format!("a/{display}")
+    };
+    let new_header = format!("b/{display}");
+    TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header(&old_header, &new_header)
+        .to_string()
 }
 
 async fn read_utf8(path: &Path) -> Result<String> {
@@ -665,6 +692,19 @@ mod tests {
             .unwrap();
         assert!(edited.content.contains("+1 -1"));
         assert!(edited.content.contains("+TWO"));
+    }
+
+    #[tokio::test]
+    async fn created_file_diff_uses_dev_null() {
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path());
+        let output = WriteFile
+            .execute(json!({"path": "new.txt", "content": "hi\n"}), &ctx)
+            .await
+            .unwrap();
+        let diff = output.diff.unwrap();
+        assert!(diff.starts_with("--- /dev/null"), "diff was: {diff}");
+        assert!(diff.contains("+++ b/new.txt"));
     }
 
     #[tokio::test]

@@ -1,0 +1,5 @@
+# Default to a project-local target directory. Note that an exported
+# CARGO_TARGET_DIR (set in this machine's ~/.bashrc) takes precedence over
+# this setting.
+[build]
+target-dir = "target"

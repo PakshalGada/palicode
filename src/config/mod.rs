@@ -4,6 +4,7 @@
 //! `$PALICODE_CONFIG`). Missing files are fine: built-in defaults are used.
 
 use anyhow::{Context, Result, bail};
+use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
@@ -20,6 +21,7 @@ pub struct Config {
     pub general: GeneralConfig,
     pub providers: ProvidersConfig,
     pub tools: ToolsConfig,
+    pub permissions: PermissionsConfig,
     pub tui: TuiConfig,
 }
 
@@ -49,12 +51,36 @@ pub enum ApprovalMode {
 
 impl fmt::Display for ApprovalMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ApprovalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
             ApprovalMode::Suggest => "suggest",
             ApprovalMode::AutoEdit => "auto-edit",
             ApprovalMode::FullAuto => "full-auto",
-        };
-        f.write_str(value)
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "suggest" | "default" => Some(ApprovalMode::Suggest),
+            "auto-edit" | "auto_edit" | "autoedit" | "edit" => Some(ApprovalMode::AutoEdit),
+            "full-auto" | "full_auto" | "fullauto" | "yolo" => Some(ApprovalMode::FullAuto),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for ApprovalMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::parse(value).with_context(|| {
+            format!("invalid approval mode '{value}' (expected suggest, auto-edit, or full-auto)")
+        })
     }
 }
 
@@ -74,8 +100,9 @@ pub struct ProviderConfig {
     /// Name of the environment variable holding the API key.
     #[serde(default)]
     pub api_key_env: String,
-    /// Literal API key. Prefer `api_key_env`; this exists for local setups.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Literal API key. Prefer `api_key_env` or the Settings screen; this exists
+    /// for local setups. Never serialized by `palicode config`.
+    #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
     #[serde(default)]
     pub default_model: String,
@@ -102,6 +129,32 @@ pub struct ToolsConfig {
     pub shell: String,
 }
 
+/// Tool permission rules. Rules are checked after the built-in safety denies;
+/// a matching deny always wins, otherwise the first matching allow/ask applies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PermissionsConfig {
+    pub rules: Vec<PermissionRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRule {
+    /// Glob matched against the tool name, e.g. "run_shell" or "write_*".
+    pub tool: String,
+    /// Optional glob matched against the tool subject (command, path, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    pub action: PermissionAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionAction {
+    Allow,
+    Ask,
+    Deny,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TuiConfig {
@@ -112,7 +165,7 @@ pub struct TuiConfig {
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
-            theme: "minimal-dark".to_string(),
+            theme: "mono-dark".to_string(),
             approval_mode: ApprovalMode::Suggest,
             log_level: "warn".to_string(),
             default_provider: None,
@@ -214,10 +267,16 @@ impl ProviderConfig {
         {
             return Some(value.trim().to_string());
         }
-        self.api_key
+        if let Some(key) = self
+            .api_key
             .as_ref()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
+        {
+            return Some(key);
+        }
+        // Settings stores keys outside config.toml (user-only permissions).
+        crate::credentials::key_for(&self.name)
     }
 
     /// True when no credential is required, or one is configured.
@@ -319,6 +378,22 @@ impl Config {
             bail!("at least one provider must be configured");
         }
 
+        for (index, rule) in self.permissions.rules.iter().enumerate() {
+            if rule.tool.trim().is_empty() {
+                bail!("permissions.rules[{index}].tool must not be empty");
+            }
+            validate_glob(&rule.tool)
+                .with_context(|| format!("permissions.rules[{index}].tool is not a valid glob"))?;
+            if let Some(pattern) = &rule.pattern {
+                if pattern.trim().is_empty() {
+                    bail!("permissions.rules[{index}].pattern must not be empty");
+                }
+                validate_glob(pattern).with_context(|| {
+                    format!("permissions.rules[{index}].pattern is not a valid glob")
+                })?;
+            }
+        }
+
         let mut seen = HashSet::new();
         for provider in &self.providers.list {
             if provider.name.trim().is_empty() {
@@ -400,6 +475,15 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+fn validate_glob(pattern: &str) -> Result<()> {
+    GlobBuilder::new(pattern)
+        .literal_separator(false)
+        .backslash_escape(false)
+        .build()
+        .with_context(|| format!("invalid glob '{pattern}'"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +515,12 @@ default_model = "qwen2.5-coder:7b"
 
 [tools]
 path_sandbox = false
+
+[permissions]
+[[permissions.rules]]
+tool = "run_shell"
+pattern = "git push*"
+action = "ask"
 "#,
         )
         .unwrap();
@@ -441,6 +531,8 @@ path_sandbox = false
         assert!(!config.tools.path_sandbox);
         assert_eq!(config.providers.list.len(), 1);
         assert_eq!(config.providers.list[0].name, "local");
+        assert_eq!(config.permissions.rules.len(), 1);
+        assert_eq!(config.permissions.rules[0].action, PermissionAction::Ask);
     }
 
     #[test]
@@ -463,6 +555,43 @@ path_sandbox = false
     fn rejects_duplicate_provider_names() {
         let mut config = Config::default();
         config.providers.list.push(config.providers.list[0].clone());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn serialized_config_never_contains_secrets() {
+        let mut config = Config::default();
+        config.providers.list[0].api_key = Some("sk-super-secret".to_string());
+        let toml = config.to_toml().unwrap();
+        assert!(!toml.contains("sk-super-secret"));
+    }
+
+    #[test]
+    fn parses_approval_modes() {
+        assert_eq!(ApprovalMode::parse("suggest"), Some(ApprovalMode::Suggest));
+        assert_eq!(
+            ApprovalMode::parse("AUTO-EDIT"),
+            Some(ApprovalMode::AutoEdit)
+        );
+        assert_eq!(ApprovalMode::parse("yolo"), Some(ApprovalMode::FullAuto));
+        assert_eq!(ApprovalMode::parse("nope"), None);
+    }
+
+    #[test]
+    fn validates_permission_rules() {
+        let mut config = Config::default();
+        config.permissions.rules.push(PermissionRule {
+            tool: "run_shell".to_string(),
+            pattern: Some("git push*".to_string()),
+            action: PermissionAction::Ask,
+        });
+        config.validate().unwrap();
+
+        config.permissions.rules.push(PermissionRule {
+            tool: String::new(),
+            pattern: None,
+            action: PermissionAction::Deny,
+        });
         assert!(config.validate().is_err());
     }
 }

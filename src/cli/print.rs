@@ -6,10 +6,11 @@ use std::io::{IsTerminal, Write};
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
-const CYAN: &str = "\x1b[36m";
-const GREEN: &str = "\x1b[32m";
-const RED: &str = "\x1b[31m";
-const YELLOW: &str = "\x1b[33m";
+// Monochrome palette: tools/info are gray, success is gray, errors are bold.
+const CYAN: &str = "\x1b[38;5;252m";
+const GREEN: &str = "\x1b[38;5;245m";
+const RED: &str = "\x1b[1;38;5;255m";
+const YELLOW: &str = "\x1b[38;5;250m";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -97,6 +98,18 @@ impl Printer {
                     self.paint(color, &header),
                     self.paint(DIM, &indented)
                 ));
+            }
+            AgentEvent::PermissionDenied { tool, reason } => {
+                let line = format!("⛔ {tool}: {reason}");
+                self.meta(&self.paint(RED, &line));
+            }
+            AgentEvent::Status(text) => {
+                self.close_text();
+                self.meta(&self.paint(DIM, &text));
+            }
+            AgentEvent::Diff { .. } => {
+                // The diff is already summarized in the tool result; Phase 3
+                // feeds this event into the diff pane.
             }
             AgentEvent::Usage(usage) => {
                 if usage.total_tokens > 0 {

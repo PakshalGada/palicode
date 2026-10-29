@@ -107,7 +107,7 @@ palicode/
 
 ### Phase 0: Bootstrap (Day 1)
 - [x] `cargo init` in `/home/pakshal/palicode`
-- [x] Add deps to `Cargo.toml` (ratatui, crossterm, tokio, reqwest, serde, toml, clap, similar, tracing; rusqlite/syntect/portable-pty deferred to their phases)
+- [x] Add deps to `Cargo.toml` (ratatui, crossterm, tokio, reqwest, serde, toml, clap, similar, syntect, tracing; rusqlite/portable-pty deferred to their phases)
 - [x] Create module structure (`cli/`, `config/`, `provider/`, `tools/`, `agent/`, `state/`, `event/`, `ui/`, `util/`)
 - [x] Basic CLI (`palicode tui`, `palicode run`, `palicode --version`)
 - [x] Config loading (`~/.config/palicode/config.toml`, env vars)
@@ -127,38 +127,39 @@ palicode/
 **Done:** Can chat with Ollama/OpenCode via REPL and call tools.
 
 ### Phase 2: Agent Loop + Plan Gate (Day 2)
-- [ ] Event bus
-- [ ] Planner (structured JSON plan)
-- [ ] Agent loop (think/tool/observe/reflect)
-- [ ] Approval gate + approval modes
-- [ ] Permissions engine
-- [ ] Subagent tool skeleton
+- [x] Event bus
+- [x] Planner (structured JSON plan)
+- [x] Agent loop (think/tool/observe/reflect)
+- [x] Approval gate + approval modes
+- [x] Permissions engine
+- [x] Subagent tool skeleton
 
 **Done:** Plan -> approve -> execute works in REPL.
 
 ### Phase 3: TUI Core (Day 2-4) - **FOCUS A**
-- [ ] App shell with layout (panes)
-- [ ] Chat view (streaming)
-- [ ] Plan view (editable checklist, reorder)
-- [ ] Diff view (unified/split, syntect highlighting, hunk nav, accept/reject)
-- [ ] Tool log view
-- [ ] Subagent sidebar
-- [ ] Status bar
-- [ ] Command palette (`Ctrl+K`)
-- [ ] Model switcher
-- [ ] Keybindings + help
-- [ ] Theme system (minimal dark)
-- [ ] Focus management + shortcuts
+- [x] App shell with layout (panes)
+- [x] Chat view (streaming)
+- [x] Plan view (editable checklist, reorder)
+- [x] Diff view (unified/split, syntect highlighting, hunk nav, accept/reject)
+- [x] Tool log view
+- [x] Subagent sidebar
+- [x] Status bar
+- [x] Command palette (`Ctrl+K`)
+- [x] Model switcher
+- [x] Keybindings + help
+- [x] Theme system (minimal dark)
+- [x] Focus management + shortcuts
+- [x] Settings screen for secure OpenCode API key storage
 
 **Done:** TUI feels minimal, shortcut-driven, feature-rich. Diff visualizer works well. Plan review smooth.
 
 ### Phase 4: Polish TUI + Sessions (Day 4-5)
-- [ ] Session list modal
-- [ ] Mouse support
-- [ ] Better streaming UX
-- [ ] Error display
-- [ ] Config UI hints
-- [ ] Performance tweaks
+- [x] Session list modal
+- [x] Mouse support
+- [x] Better streaming UX
+- [x] Error display
+- [x] Config UI hints
+- [x] Performance tweaks
 
 **Done:** Daily-usable TUI.
 
