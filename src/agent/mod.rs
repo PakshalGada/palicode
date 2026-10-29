@@ -14,12 +14,14 @@ use crate::approval::{
 };
 use crate::config::{ApprovalMode, Config};
 use crate::event::{Event, EventBus};
+use crate::provider::types::Role;
 use crate::provider::{ChatRequest, ChatResponse, Message, Provider, ToolCall, Usage};
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use crate::util::text::truncate_middle;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -62,12 +64,23 @@ pub enum AgentEvent {
         diff: String,
     },
     Usage(Usage),
+    ResponseStats {
+        duration_ms: u128,
+        completion_tokens: u64,
+        estimated: bool,
+        model: String,
+    },
     StepLimit {
         steps: usize,
     },
 }
 
 pub type EventSink<'a> = &'a mut (dyn FnMut(AgentEvent) + Send);
+
+/// Receives durable conversation snapshots (implemented by the SQLite layer).
+pub trait CheckpointSink: Send + Sync {
+    fn checkpoint(&self, messages: &[Message], kind: &str);
+}
 
 /// Per-turn options.
 #[derive(Debug, Clone, Copy, Default)]
@@ -96,6 +109,11 @@ pub struct AgentSession {
     bus: EventBus,
     config: Arc<Config>,
     depth: usize,
+    checkpoint_sink: Option<Arc<dyn CheckpointSink>>,
+    compact_after_chars: usize,
+    compact_keep_messages: usize,
+    verify_command: Option<String>,
+    verify_retries: usize,
 }
 
 impl AgentSession {
@@ -136,6 +154,10 @@ impl AgentSession {
         // Subagents and headless sessions cannot prompt; anything that still
         // needs approval is denied rather than silently allowed.
         let approver: Arc<dyn Approver> = Arc::new(NonInteractiveApprover::default());
+        let compact_after_chars = config.general.compact_after_chars;
+        let compact_keep_messages = config.general.compact_keep_messages;
+        let verify_command = config.general.verify_command.clone();
+        let verify_retries = config.general.verify_retries;
 
         let mut session = Self {
             provider,
@@ -150,6 +172,11 @@ impl AgentSession {
             bus,
             config,
             depth,
+            checkpoint_sink: None,
+            compact_after_chars,
+            compact_keep_messages,
+            verify_command,
+            verify_retries,
         };
         session.install_subagent();
         session
@@ -185,6 +212,91 @@ impl AgentSession {
         self.install_subagent();
     }
 
+    pub fn set_checkpoint_sink(&mut self, sink: Arc<dyn CheckpointSink>) {
+        self.checkpoint_sink = Some(sink);
+        self.checkpoint("attach");
+    }
+
+    fn checkpoint(&self, kind: &str) {
+        if let Some(sink) = &self.checkpoint_sink {
+            sink.checkpoint(&self.messages, kind);
+        }
+    }
+
+    pub fn verify_command(&self) -> Option<&str> {
+        self.verify_command.as_deref()
+    }
+
+    pub fn verify_retries(&self) -> usize {
+        self.verify_retries
+    }
+
+    /// Summarize older history once it grows beyond the configured threshold.
+    pub async fn maybe_compact(&mut self) -> Result<bool> {
+        let chars: usize = self
+            .messages
+            .iter()
+            .map(|message| {
+                message.content.as_ref().map_or(0, String::len)
+                    + message
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.name.len() + call.arguments.len())
+                        .sum::<usize>()
+            })
+            .sum();
+        if chars < self.compact_after_chars || self.messages.len() <= self.compact_keep_messages + 2
+        {
+            return Ok(false);
+        }
+
+        let keep = self.compact_keep_messages.max(2);
+        let mut keep_start = self.messages.len().saturating_sub(keep);
+        while keep_start < self.messages.len() && self.messages[keep_start].role != Role::User {
+            keep_start += 1;
+        }
+        if keep_start >= self.messages.len() {
+            keep_start = self.messages.len().saturating_sub(keep);
+        }
+        if keep_start <= 1 {
+            return Ok(false);
+        }
+
+        let transcript = render_transcript(&self.messages[1..keep_start]);
+        let request = ChatRequest {
+            model: self.model.clone(),
+            messages: vec![Message::system(COMPACTOR_PROMPT), Message::user(transcript)],
+            tools: Vec::new(),
+            temperature: Some(0.1),
+            max_tokens: Some(1_500),
+        };
+        let response = self
+            .provider
+            .chat(request)
+            .await
+            .context("context compaction request failed")?;
+        let summary = response.content.trim();
+        if summary.is_empty() {
+            bail!("context compactor returned an empty summary");
+        }
+
+        let system = self
+            .messages
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Message::system(self.system_prompt.clone()));
+        let mut compacted = Vec::with_capacity(2 + self.messages.len() - keep_start);
+        compacted.push(system);
+        compacted.push(Message::system(format!(
+            "[context summary of earlier work]
+{summary}"
+        )));
+        compacted.extend_from_slice(&self.messages[keep_start..]);
+        self.messages = compacted;
+        self.checkpoint("compaction");
+        Ok(true)
+    }
+
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>, model: impl Into<String>) {
         self.provider = provider;
         self.model = model.into();
@@ -209,12 +321,35 @@ impl AgentSession {
     }
 
     /// Replace the conversation (must include a system message).
-    pub fn import_messages(&mut self, messages: Vec<Message>) {
+    pub fn import_messages(&mut self, mut messages: Vec<Message>) {
         if messages.is_empty() {
             self.reset();
-        } else {
-            self.messages = messages;
+            return;
         }
+        // A crash can leave an assistant tool call without its observation.
+        // Close those calls so the resumed conversation is valid.
+        let mut pending: HashMap<String, String> = HashMap::new();
+        for message in &messages {
+            if message.role == Role::Assistant {
+                for call in &message.tool_calls {
+                    pending.insert(call.id.clone(), call.name.clone());
+                }
+            } else if message.role == Role::Tool
+                && let Some(id) = &message.tool_call_id
+            {
+                pending.remove(id);
+            }
+        }
+        for (id, name) in pending {
+            messages.push(Message::tool_result(
+                id,
+                format!(
+                    "ERROR: tool '{name}' was interrupted before returning a result;                      re-check the workspace state before retrying."
+                ),
+            ));
+        }
+        self.messages = messages;
+        self.checkpoint("import");
     }
 
     pub fn system_prompt(&self) -> &str {
@@ -253,6 +388,7 @@ impl AgentSession {
     /// Clear conversation history but keep the current system prompt.
     pub fn reset(&mut self) {
         self.messages = vec![Message::system(self.system_prompt.clone())];
+        self.checkpoint("reset");
     }
 
     /// Run one user turn with default options.
@@ -269,6 +405,7 @@ impl AgentSession {
         emit: EventSink<'_>,
     ) -> Result<TurnResult> {
         self.messages.push(Message::user(input));
+        self.checkpoint("turn_start");
         self.bus.publish(Event::Status("thinking".to_string()));
 
         let mut result = TurnResult::default();
@@ -282,6 +419,7 @@ impl AgentSession {
                 max_tokens: None,
             };
 
+            let response_started = Instant::now();
             let (response, text_streamed) = match self.stream_response(request, emit).await {
                 Ok(value) => value,
                 Err(err) => {
@@ -289,6 +427,7 @@ impl AgentSession {
                     return Err(err);
                 }
             };
+            let duration_ms = response_started.elapsed().as_millis();
             if let Some(usage) = response.usage {
                 dispatch(&self.bus, &mut *emit, AgentEvent::Usage(usage));
             }
@@ -305,6 +444,25 @@ impl AgentSession {
                 }
                 result.text = response.content.clone();
             }
+            if text_streamed || !response.content.trim().is_empty() {
+                let provider_tokens = response
+                    .usage
+                    .map(|usage| usage.completion_tokens)
+                    .filter(|tokens| *tokens > 0);
+                let estimated = provider_tokens.is_none();
+                let completion_tokens =
+                    provider_tokens.unwrap_or_else(|| estimate_tokens(&response.content));
+                dispatch(
+                    &self.bus,
+                    &mut *emit,
+                    AgentEvent::ResponseStats {
+                        duration_ms,
+                        completion_tokens,
+                        estimated,
+                        model: format!("{}/{}", self.provider.name(), self.model),
+                    },
+                );
+            }
             debug!(
                 finish_reason = ?response.finish_reason,
                 tool_calls = response.tool_calls.len(),
@@ -320,8 +478,10 @@ impl AgentSession {
             };
             self.messages
                 .push(Message::assistant(content, calls.clone()));
+            self.checkpoint("assistant");
 
             if calls.is_empty() {
+                self.checkpoint("turn_end");
                 self.bus.publish(Event::Status("idle".to_string()));
                 return Ok(result);
             }
@@ -333,6 +493,7 @@ impl AgentSession {
                     .await;
                 self.messages
                     .push(Message::tool_result(&observation.id, observation.output));
+                self.checkpoint("tool_result");
             }
         }
 
@@ -340,6 +501,7 @@ impl AgentSession {
             "step limit reached ({} steps); the task may need a narrower prompt",
             self.max_steps
         );
+        self.checkpoint("step_limit");
         self.bus.publish(Event::Error(message.clone()));
         dispatch(
             &self.bus,
@@ -556,6 +718,44 @@ struct Observation {
     output: String,
 }
 
+fn estimate_tokens(text: &str) -> u64 {
+    (text.chars().count() as u64).div_ceil(4).max(1)
+}
+
+const COMPACTOR_PROMPT: &str = "You are compacting a coding-agent conversation for long-horizon continuation. \n\
+     Preserve: the user's goals, decisions, files changed, commands/tests run and their outcomes, \n\
+     unresolved failures, plan status, and concrete next steps. Drop chit-chat and redundant tool output. \n\
+     Return a concise but complete summary as plain text.";
+
+fn render_transcript(messages: &[Message]) -> String {
+    let mut output = String::new();
+    for message in messages {
+        let label = match message.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+        output.push_str(label);
+        if let Some(id) = &message.tool_call_id {
+            output.push_str(&format!(" ({id})"));
+        }
+        output.push_str(": ");
+        if let Some(content) = &message.content {
+            output.push_str(&truncate_middle(content, 4_000));
+        }
+        for call in &message.tool_calls {
+            output.push_str(&format!(
+                "\n  tool_call {} {}",
+                call.name,
+                truncate_middle(&call.arguments, 500)
+            ));
+        }
+        output.push_str("\n\n");
+    }
+    truncate_middle(&output, 120_000)
+}
+
 pub fn default_system_prompt(cwd: &Path) -> String {
     format!(
         "You are palicode, a terminal coding agent working in {cwd}.\n\
@@ -628,6 +828,27 @@ mod tests {
         }
     }
 
+    struct RecordingSink {
+        snapshots: Mutex<Vec<(String, usize)>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                snapshots: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl CheckpointSink for RecordingSink {
+        fn checkpoint(&self, messages: &[Message], kind: &str) {
+            self.snapshots
+                .lock()
+                .unwrap()
+                .push((kind.to_string(), messages.len()));
+        }
+    }
+
     fn write_then_finish() -> Vec<ChatResponse> {
         vec![
             ChatResponse {
@@ -694,6 +915,148 @@ mod tests {
                 .messages()
                 .iter()
                 .any(|message| message.content.as_deref() == Some("hello back"))
+        );
+    }
+
+    #[tokio::test]
+    async fn emits_response_timing_stats() {
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path());
+        let config = test_config(ApprovalMode::FullAuto);
+        let provider = ScriptedProvider::new(vec![ChatResponse {
+            content: "hello there".to_string(),
+            ..ChatResponse::default()
+        }]);
+        let mut session = AgentSession::new(
+            provider,
+            "scripted".to_string(),
+            ToolRegistry::with_defaults(),
+            ctx,
+            &config,
+        );
+        let mut events = Vec::new();
+        session
+            .run_turn("hi", &mut |event| events.push(event))
+            .await
+            .unwrap();
+        let stats = events.iter().find_map(|event| match event {
+            AgentEvent::ResponseStats {
+                duration_ms,
+                completion_tokens,
+                estimated,
+                model,
+            } => Some((*duration_ms, *completion_tokens, *estimated, model.clone())),
+            _ => None,
+        });
+        let (_, tokens, estimated, model) = stats.expect("missing response stats");
+        assert!(tokens > 0);
+        assert!(estimated);
+        assert_eq!(model, "scripted/scripted");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_sink_receives_turn_snapshots() {
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path());
+        let config = test_config(ApprovalMode::FullAuto);
+        let provider = ScriptedProvider::new(vec![ChatResponse {
+            content: "ok".to_string(),
+            ..ChatResponse::default()
+        }]);
+        let mut session = AgentSession::new(
+            provider,
+            "scripted".to_string(),
+            ToolRegistry::with_defaults(),
+            ctx,
+            &config,
+        );
+        let sink = RecordingSink::new();
+        session.set_checkpoint_sink(sink.clone());
+        session.run_turn("hello", &mut |_| {}).await.unwrap();
+        let snapshots = sink.snapshots.lock().unwrap();
+        let kinds: Vec<&str> = snapshots.iter().map(|(kind, _)| kind.as_str()).collect();
+        assert!(kinds.contains(&"attach"));
+        assert!(kinds.contains(&"turn_start"));
+        assert!(kinds.contains(&"turn_end"));
+        assert!(snapshots.iter().any(|(_, len)| *len >= 3));
+    }
+
+    #[tokio::test]
+    async fn resumes_after_an_interrupted_tool_call() {
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path());
+        let config = test_config(ApprovalMode::FullAuto);
+        let provider = ScriptedProvider::new(vec![]);
+        let mut session = AgentSession::new(
+            provider,
+            "scripted".to_string(),
+            ToolRegistry::with_defaults(),
+            ctx,
+            &config,
+        );
+        session.import_messages(vec![
+            Message::system("sys"),
+            Message::assistant(
+                Some(String::new()),
+                vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: "{\"path\":\"a\",\"content\":\"x\"}".to_string(),
+                }],
+            ),
+        ]);
+        let messages = session.messages();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2].role, Role::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert!(
+            messages[2]
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("ERROR:")
+        );
+    }
+
+    #[tokio::test]
+    async fn compacts_old_history_into_a_summary() {
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path());
+        let mut config = test_config(ApprovalMode::FullAuto);
+        config.general.compact_after_chars = 1_000;
+        config.general.compact_keep_messages = 2;
+        let provider = ScriptedProvider::new(vec![ChatResponse {
+            content: "SUMMARY".to_string(),
+            ..ChatResponse::default()
+        }]);
+        let mut session = AgentSession::new(
+            provider,
+            "scripted".to_string(),
+            ToolRegistry::with_defaults(),
+            ctx,
+            &config,
+        );
+        session.import_messages(vec![
+            Message::system("system"),
+            Message::user("x".repeat(2_000)),
+            Message::assistant(Some("old answer".to_string()), Vec::new()),
+            Message::assistant(Some("another old answer".to_string()), Vec::new()),
+            Message::user("recent question"),
+        ]);
+        assert!(session.maybe_compact().await.unwrap());
+        let messages = session.messages();
+        assert!(messages.len() < 4);
+        assert!(
+            messages.iter().any(|message| message
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("SUMMARY"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.as_deref() == Some("recent question"))
         );
     }
 

@@ -127,6 +127,9 @@ pub async fn run_once(
         if outcome.failed > 0 {
             bail!("plan finished with {} failed step(s)", outcome.failed);
         }
+        if outcome.verified == Some(false) {
+            bail!("verification failed after self-heal attempts");
+        }
         return Ok(());
     }
 

@@ -39,6 +39,16 @@ pub struct GeneralConfig {
     pub max_steps: usize,
     /// Replace the built-in system prompt.
     pub system_prompt: Option<String>,
+    /// Compact history once the approximate character count exceeds this.
+    pub compact_after_chars: usize,
+    /// Number of recent messages kept verbatim when compacting.
+    pub compact_keep_messages: usize,
+    /// Optional command run after plan execution (e.g. "cargo test").
+    pub verify_command: Option<String>,
+    /// Self-heal attempts when verification fails.
+    pub verify_retries: usize,
+    /// Write HANDOFF.md in the workspace when the TUI exits.
+    pub handoff_on_exit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +182,11 @@ impl Default for GeneralConfig {
             default_model: None,
             max_steps: 32,
             system_prompt: None,
+            compact_after_chars: 120_000,
+            compact_keep_messages: 12,
+            verify_command: None,
+            verify_retries: 1,
+            handoff_on_exit: true,
         }
     }
 }
@@ -361,6 +376,15 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.general.max_steps == 0 {
             bail!("general.max_steps must be greater than zero");
+        }
+        if self.general.compact_after_chars < 1_000 {
+            bail!("general.compact_after_chars must be at least 1000");
+        }
+        if self.general.compact_keep_messages < 2 {
+            bail!("general.compact_keep_messages must be at least 2");
+        }
+        if self.general.verify_retries > 10 {
+            bail!("general.verify_retries must be at most 10");
         }
         if self.tools.shell_timeout_secs == 0 {
             bail!("tools.shell_timeout_secs must be greater than zero");

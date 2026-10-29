@@ -2,16 +2,18 @@
 
 use crate::agent::executor::{self, PlanOutcome};
 use crate::agent::plan::Plan;
-use crate::agent::{AgentEvent, AgentSession};
+use crate::agent::{AgentEvent, AgentSession, CheckpointSink};
 use crate::approval::{ApprovalRequest, ApprovalResponse, Approver};
 use crate::config::{ApprovalMode, Config};
 use crate::event::Event;
 use crate::provider::{self, Message};
+use crate::state::StateStore;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tracing::warn;
 
 #[derive(Debug)]
 pub enum AgentCommand {
@@ -20,12 +22,21 @@ pub enum AgentCommand {
     ExecutePlan { plan: Plan, selected: Vec<usize> },
     SetModel(String),
     SetProvider(String),
-    ListModels,
+    SetProviderModel { provider: String, model: String },
+    ListAllModels,
     SetMode(ApprovalMode),
     ClearHistory,
     NewSession(String),
     SwitchSession(String),
     DeleteSession(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelGroup {
+    pub provider: String,
+    pub models: Vec<String>,
+    pub error: Option<String>,
+    pub has_credentials: bool,
 }
 
 pub enum UiMessage {
@@ -35,10 +46,10 @@ pub enum UiMessage {
         request: ApprovalRequest,
         reply: oneshot::Sender<ApprovalResponse>,
     },
-    Models {
-        provider: String,
-        current: String,
-        models: Vec<String>,
+    ModelGroups {
+        current_provider: String,
+        current_model: String,
+        groups: Vec<ModelGroup>,
     },
     ModelChanged {
         provider: String,
@@ -53,6 +64,60 @@ pub enum UiMessage {
     Error(String),
     TurnFinished,
     PlanFinished(PlanOutcome),
+}
+
+struct StateCheckpointer {
+    store: StateStore,
+    session_id: Arc<Mutex<String>>,
+}
+
+impl CheckpointSink for StateCheckpointer {
+    fn checkpoint(&self, messages: &[Message], kind: &str) {
+        let session_id = self
+            .session_id
+            .lock()
+            .map(|id| id.clone())
+            .unwrap_or_else(|_| "default".to_string());
+        if let Err(err) = self.store.save_checkpoint(&session_id, messages, kind) {
+            warn!(error = %err, session = %session_id, "checkpoint failed");
+        }
+    }
+}
+
+fn set_session_id(shared: &Arc<Mutex<String>>, id: &str) {
+    if let Ok(mut current) = shared.lock() {
+        *current = id.to_string();
+    }
+}
+
+pub fn spawn(
+    mut session: AgentSession,
+    config: Config,
+    store: Option<StateStore>,
+    initial_session: String,
+    commands: mpsc::UnboundedReceiver<AgentCommand>,
+    ui: mpsc::UnboundedSender<UiMessage>,
+) -> tokio::task::JoinHandle<()> {
+    let session_id = Arc::new(Mutex::new(initial_session.clone()));
+    if let Some(store) = &store {
+        session.set_checkpoint_sink(Arc::new(StateCheckpointer {
+            store: store.clone(),
+            session_id: Arc::clone(&session_id),
+        }));
+    }
+    session.set_approver(Arc::new(TuiApprover { tx: ui.clone() }));
+    tokio::spawn(async move {
+        run(
+            session,
+            config,
+            store,
+            initial_session,
+            session_id,
+            commands,
+            ui,
+        )
+        .await;
+    })
 }
 
 struct TuiApprover {
@@ -75,26 +140,17 @@ impl Approver for TuiApprover {
     }
 }
 
-pub fn spawn(
-    mut session: AgentSession,
-    config: Config,
-    commands: mpsc::UnboundedReceiver<AgentCommand>,
-    ui: mpsc::UnboundedSender<UiMessage>,
-) -> tokio::task::JoinHandle<()> {
-    session.set_approver(Arc::new(TuiApprover { tx: ui.clone() }));
-    tokio::spawn(async move {
-        run(session, config, commands, ui).await;
-    })
-}
-
 async fn run(
     mut session: AgentSession,
     config: Config,
+    store: Option<StateStore>,
+    initial_session: String,
+    session_id: Arc<Mutex<String>>,
     mut commands: mpsc::UnboundedReceiver<AgentCommand>,
     ui: mpsc::UnboundedSender<UiMessage>,
 ) {
     let mut sessions: HashMap<String, Vec<Message>> = HashMap::new();
-    let mut current_session = "default".to_string();
+    let mut current_session = initial_session;
     let mut bus_rx = session.bus().subscribe();
     let bus_tx = ui.clone();
     let bus_task = tokio::spawn(async move {
@@ -119,6 +175,18 @@ async fn run(
             AgentCommand::Submit(prompt) => {
                 if let Err(err) = run_turn(&mut session, &prompt, &ui).await {
                     let _ = ui.send(UiMessage::Error(format!("{err:#}")));
+                } else {
+                    match session.maybe_compact().await {
+                        Ok(true) => {
+                            session
+                                .bus()
+                                .publish(Event::Status("context compacted".to_string()));
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            warn!(error = %err, "context compaction failed");
+                        }
+                    }
                 }
                 let _ = ui.send(UiMessage::TurnFinished);
             }
@@ -130,7 +198,14 @@ async fn run(
                     .create(&task, &session.context().cwd, &tools)
                     .await
                 {
-                    Ok(plan) => session.bus().publish(Event::Plan(plan)),
+                    Ok(plan) => {
+                        if let Some(store) = &store
+                            && let Err(err) = store.save_plan(&current_session, &plan)
+                        {
+                            warn!(error = %err, "cannot persist plan");
+                        }
+                        session.bus().publish(Event::Plan(plan));
+                    }
                     Err(err) => {
                         let message = format!("planning failed: {err:#}");
                         session.bus().publish(Event::Error(message.clone()));
@@ -146,6 +221,20 @@ async fn run(
                 };
                 match executor::execute_plan(&mut session, &mut plan, &selected, &mut sink).await {
                     Ok(outcome) => {
+                        if let Some(store) = &store
+                            && let Err(err) = store.save_plan(&current_session, &plan)
+                        {
+                            warn!(error = %err, "cannot persist plan status");
+                        }
+                        match session.maybe_compact().await {
+                            Ok(true) => session
+                                .bus()
+                                .publish(Event::Status("context compacted".to_string())),
+                            Ok(false) => {}
+                            Err(err) => {
+                                warn!(error = %err, "context compaction failed");
+                            }
+                        }
                         let _ = ui.send(UiMessage::PlanFinished(outcome));
                     }
                     Err(err) => {
@@ -180,18 +269,43 @@ async fn run(
                     }
                 }
             }
-            AgentCommand::ListModels => match session.provider().list_models().await {
-                Ok(models) => {
-                    let _ = ui.send(UiMessage::Models {
-                        provider: session.provider().name().to_string(),
-                        current: session.model().to_string(),
-                        models,
-                    });
+            AgentCommand::SetProviderModel { provider, model } => {
+                match provider::resolve(&config, Some(&provider), Some(&model)).await {
+                    Ok(resolved) => {
+                        let provider = resolved.provider.name().to_string();
+                        let model = resolved.model;
+                        session.set_provider(resolved.provider, model.clone());
+                        let _ = ui.send(UiMessage::ProviderChanged { provider, model });
+                        let _ = ui.send(UiMessage::TurnFinished);
+                    }
+                    Err(err) => {
+                        let _ = ui.send(UiMessage::Error(format!("{err:#}")));
+                    }
                 }
-                Err(err) => {
-                    let _ = ui.send(UiMessage::Error(format!("{err:#}")));
-                }
-            },
+            }
+            AgentCommand::ListAllModels => {
+                let probes = provider::probe_all(&config).await;
+                let groups = probes
+                    .into_iter()
+                    .map(|probe| {
+                        let (models, error) = match probe.result {
+                            Ok(models) => (models, None),
+                            Err(error) => (Vec::new(), Some(error)),
+                        };
+                        ModelGroup {
+                            provider: probe.name,
+                            models,
+                            error,
+                            has_credentials: probe.has_credentials,
+                        }
+                    })
+                    .collect();
+                let _ = ui.send(UiMessage::ModelGroups {
+                    current_provider: session.provider().name().to_string(),
+                    current_model: session.model().to_string(),
+                    groups,
+                });
+            }
             AgentCommand::SetMode(mode) => {
                 session.set_approval_mode(mode);
                 let _ = ui.send(UiMessage::ModeChanged(mode));
@@ -202,6 +316,7 @@ async fn run(
             }
             AgentCommand::NewSession(id) => {
                 sessions.insert(current_session.clone(), session.export_messages());
+                set_session_id(&session_id, &id);
                 current_session = id;
                 session.reset();
                 let _ = ui.send(UiMessage::TurnFinished);
@@ -209,17 +324,30 @@ async fn run(
             AgentCommand::SwitchSession(id) => {
                 if id != current_session {
                     sessions.insert(current_session.clone(), session.export_messages());
-                    match sessions.get(&id).cloned() {
+                    let messages = match sessions.get(&id).cloned() {
+                        Some(messages) => Some(messages),
+                        None => store
+                            .as_ref()
+                            .and_then(|store| store.load_messages(&id).ok())
+                            .filter(|messages| !messages.is_empty()),
+                    };
+                    set_session_id(&session_id, &id);
+                    current_session = id;
+                    match messages {
                         Some(messages) => session.import_messages(messages),
                         None => session.reset(),
                     }
-                    current_session = id;
                 }
                 let _ = ui.send(UiMessage::TurnFinished);
             }
             AgentCommand::DeleteSession(id) => {
                 if id != current_session {
                     sessions.remove(&id);
+                    if let Some(store) = &store
+                        && let Err(err) = store.delete_session(&id)
+                    {
+                        warn!(error = %err, "cannot delete session from state");
+                    }
                 }
             }
         }
@@ -248,9 +376,9 @@ mod tests {
     use crate::config::{ApprovalMode, Config, ToolsConfig};
     use crate::provider::types::{ProviderStream, Role};
     use crate::provider::{ChatRequest, ChatResponse, StreamEvent};
+    use crate::state::{SESSION_ACTIVE, SessionRecord, now_epoch};
     use crate::tools::{ToolContext, ToolRegistry};
     use async_trait::async_trait;
-    use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::time::timeout;
@@ -318,12 +446,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoints_sessions_to_sqlite() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::open_at(&dir.path().join("state.db")).unwrap();
+        let now = now_epoch();
+        store
+            .insert_session(&SessionRecord {
+                id: "default".to_string(),
+                title: "Test".to_string(),
+                provider: "echo".to_string(),
+                model: "echo".to_string(),
+                cwd: dir.path().display().to_string(),
+                status: SESSION_ACTIVE.to_string(),
+                turns: 0,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let config = Config::default();
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let shared_id = Arc::new(Mutex::new("default".to_string()));
+        let mut session = session(dir.path());
+        session.set_checkpoint_sink(Arc::new(StateCheckpointer {
+            store: store.clone(),
+            session_id: shared_id.clone(),
+        }));
+        let worker = tokio::spawn(run(
+            session,
+            config,
+            Some(store.clone()),
+            "default".to_string(),
+            shared_id,
+            command_rx,
+            ui_tx,
+        ));
+
+        command_tx
+            .send(AgentCommand::Submit("first".to_string()))
+            .unwrap();
+        assert_eq!(next_turn(&mut ui_rx).await, "first");
+        let persisted = store.load_messages("default").unwrap();
+        assert!(
+            persisted
+                .iter()
+                .any(|message| message.content.as_deref() == Some("first"))
+        );
+
+        command_tx
+            .send(AgentCommand::NewSession("s2".to_string()))
+            .unwrap();
+        let _ = next_turn(&mut ui_rx).await;
+        command_tx
+            .send(AgentCommand::Submit("second".to_string()))
+            .unwrap();
+        assert_eq!(next_turn(&mut ui_rx).await, "second");
+        command_tx
+            .send(AgentCommand::SwitchSession("default".to_string()))
+            .unwrap();
+        let _ = next_turn(&mut ui_rx).await;
+        command_tx
+            .send(AgentCommand::Submit("third".to_string()))
+            .unwrap();
+        assert_eq!(next_turn(&mut ui_rx).await, "first|third");
+
+        let default_messages = store.load_messages("default").unwrap();
+        let users: Vec<&str> = default_messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .filter_map(|message| message.content.as_deref())
+            .collect();
+        assert_eq!(users, vec!["first", "third"]);
+        let second_messages = store.load_messages("s2").unwrap();
+        let second_users: Vec<&str> = second_messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .filter_map(|message| message.content.as_deref())
+            .collect();
+        assert_eq!(second_users, vec!["second"]);
+        worker.abort();
+    }
+
+    #[tokio::test]
     async fn switches_session_histories() {
         let dir = tempdir().unwrap();
         let config = Config::default();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
-        let worker = tokio::spawn(run(session(dir.path()), config, command_rx, ui_tx));
+        let worker = tokio::spawn(run(
+            session(dir.path()),
+            config,
+            None,
+            "default".to_string(),
+            Arc::new(Mutex::new("default".to_string())),
+            command_rx,
+            ui_tx,
+        ));
 
         command_tx
             .send(AgentCommand::Submit("first".to_string()))

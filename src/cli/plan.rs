@@ -58,6 +58,9 @@ pub async fn interactive(
         if outcome.failed > 0 {
             printer.error(&format!("{} plan step(s) failed", outcome.failed));
         }
+        if outcome.verified == Some(false) {
+            printer.error("verification failed after self-heal attempts");
+        }
         return Ok(());
     }
 
@@ -97,6 +100,9 @@ pub async fn interactive(
         .await?;
     if outcome.failed > 0 {
         printer.error(&format!("{} plan step(s) failed", outcome.failed));
+    }
+    if outcome.verified == Some(false) {
+        printer.error("verification failed after self-heal attempts");
     }
     Ok(())
 }

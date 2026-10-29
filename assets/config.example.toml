@@ -8,6 +8,14 @@ log_level = "warn"        # error | warn | info | debug | trace
 # default_provider = "ollama"
 # default_model = "qwen3.5:9b"
 max_steps = 32
+# Compact older context once the transcript grows beyond this many characters.
+compact_after_chars = 120000
+compact_keep_messages = 12
+# Optional verification command run after plan execution; failures trigger
+# self-heal turns (up to verify_retries).
+# verify_command = "cargo test"
+verify_retries = 1
+handoff_on_exit = true
 # system_prompt = "You are palicode, a concise coding agent."
 
 [providers]

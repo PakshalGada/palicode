@@ -156,6 +156,7 @@ impl ToolRegistry {
         registry.register(git::GitStatus);
         registry.register(git::GitDiff);
         registry.register(task::TaskTool);
+        registry.register(task::TaskDagTool);
         registry
     }
 
@@ -164,7 +165,7 @@ impl ToolRegistry {
         let tools = self
             .tools
             .iter()
-            .filter(|(name, tool)| **name != "task" && tool.read_only())
+            .filter(|(name, tool)| **name != "task" && **name != "task_dag" && tool.read_only())
             .map(|(name, tool)| (*name, Arc::clone(tool)))
             .collect();
         Self { tools }
@@ -286,6 +287,7 @@ mod tests {
             "git_status",
             "git_diff",
             "task",
+            "task_dag",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -301,6 +303,7 @@ mod tests {
         assert!(subagent.get("write_file").is_none());
         assert!(subagent.get("run_shell").is_none());
         assert!(subagent.get("task").is_none());
+        assert!(subagent.get("task_dag").is_none());
     }
 
     #[test]

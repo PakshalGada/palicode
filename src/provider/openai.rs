@@ -18,6 +18,8 @@ use tracing::{debug, warn};
 
 const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 const ERROR_BODY_LIMIT: usize = 4_000;
+const MAX_RATE_LIMIT_RETRIES: usize = 2;
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
 
 pub struct OpenAiCompatible {
     name: String,
@@ -45,6 +47,59 @@ impl OpenAiCompatible {
 
     fn chat_url(&self) -> String {
         format!("{}/chat/completions", self.base_url)
+    }
+
+    async fn send_with_retry<F>(&self, build: F, label: &str) -> Result<reqwest::Response>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut attempt = 0usize;
+        loop {
+            let response = build()
+                .send()
+                .await
+                .with_context(|| format!("cannot reach provider '{}'", self.name))?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(response);
+            }
+
+            let wait = retry_delay(
+                response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                attempt,
+            );
+            let body = response.text().await.unwrap_or_default();
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < MAX_RATE_LIMIT_RETRIES
+            {
+                debug!(
+                    provider = %self.name,
+                    attempt = attempt + 1,
+                    wait_ms = wait.as_millis(),
+                    "rate limited; retrying"
+                );
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+                continue;
+            }
+
+            let hint = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                "\nhint: provider rate limit or quota reached. Wait and retry, switch model/provider, \
+                 or check OpenCode Console credits. Free models are throttled more aggressively."
+            } else {
+                ""
+            };
+            bail!(
+                "provider '{}' {} returned HTTP {}: {}{hint}",
+                self.name,
+                label,
+                status,
+                truncate_middle(body.trim(), ERROR_BODY_LIMIT)
+            );
+        }
     }
 
     fn auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -86,23 +141,13 @@ impl Provider for OpenAiCompatible {
             "starting chat stream"
         );
 
+        let url = self.chat_url();
         let response = self
-            .auth(self.client.post(self.chat_url()))
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("cannot reach provider '{}'", self.name))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            bail!(
-                "provider '{}' returned HTTP {}: {}",
-                self.name,
-                status,
-                truncate_middle(text.trim(), ERROR_BODY_LIMIT)
-            );
-        }
+            .send_with_retry(
+                || self.auth(self.client.post(&url)).json(&body),
+                "chat request",
+            )
+            .await?;
 
         let mut byte_stream = response.bytes_stream();
         let (tx, stream) = ProviderStream::channel(256);
@@ -157,22 +202,14 @@ impl Provider for OpenAiCompatible {
 
     async fn list_models(&self) -> Result<Vec<String>> {
         let response = self
-            .auth(self.client.get(&self.models_url))
-            .timeout(MODELS_TIMEOUT)
-            .send()
-            .await
-            .with_context(|| format!("cannot list models from '{}'", self.name))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            bail!(
-                "provider '{}' model list returned HTTP {}: {}",
-                self.name,
-                status,
-                truncate_tail(text.trim(), ERROR_BODY_LIMIT)
-            );
-        }
+            .send_with_retry(
+                || {
+                    self.auth(self.client.get(&self.models_url))
+                        .timeout(MODELS_TIMEOUT)
+                },
+                "model list",
+            )
+            .await?;
 
         let value: Value = response
             .json()
@@ -255,6 +292,15 @@ fn to_wire_message(message: &Message) -> WireMessage {
         }),
         tool_call_id: message.tool_call_id.clone(),
     }
+}
+
+fn retry_delay(retry_after: Option<&str>, attempt: usize) -> Duration {
+    let from_header = retry_after
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    from_header
+        .unwrap_or_else(|| Duration::from_secs(2_u64.saturating_pow(attempt as u32)))
+        .min(MAX_RETRY_WAIT)
 }
 
 /// Feed one SSE event into the assembler and forward resulting events.
@@ -558,6 +604,14 @@ mod tests {
         }
         events.extend(decoder.finish());
         events
+    }
+
+    #[test]
+    fn retry_delay_honors_and_caps_retry_after() {
+        assert_eq!(retry_delay(Some("3"), 0), Duration::from_secs(3));
+        assert_eq!(retry_delay(Some("300"), 0), MAX_RETRY_WAIT);
+        assert_eq!(retry_delay(None, 1), Duration::from_secs(2));
+        assert_eq!(retry_delay(Some("bad"), 0), Duration::from_secs(1));
     }
 
     #[test]

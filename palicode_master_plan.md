@@ -164,16 +164,27 @@ palicode/
 **Done:** Daily-usable TUI.
 
 ### Phase 5: Long-Horizon (Phase B) - After TUI solid
-- [ ] SQLite schema + migrations
-- [ ] Checkpoint system (WAL)
-- [ ] Resume logic + crash detection
-- [ ] Task list/switch
-- [ ] Context compactor
-- [ ] Handoff summary
-- [ ] Verified completion + self-heal
-- [ ] Task DAG + parallel subagents
+- [x] SQLite schema + migrations
+- [x] Checkpoint system (WAL)
+- [x] Resume logic + crash detection
+- [x] Task list/switch
+- [x] Context compactor
+- [x] Handoff summary
+- [x] Verified completion + self-heal
+- [x] Task DAG + parallel subagents
 
 **Done:** Crash-safe resume works.
+
+### Post-plan polish
+- [x] Global `palicode` command (`install.sh`)
+- [x] Project-scoped sessions, sandbox, and resume (git-root aware)
+- [x] Welcome screen with centered plain-text `palicode` + textbox (no description)
+- [x] Slim project/session sidebar with `+` new-session button and hover marquee
+- [x] Mode/provider/model/tokens/Ctrl+K metadata under the textbox
+- [x] Per-answer footer: elapsed time, tok/s, provider/model
+- [x] Right-side plan + agents, diff in main panel
+- [x] Black-and-white monochrome theme
+- [x] Combined OpenCode + Ollama model switcher
 
 ---
 

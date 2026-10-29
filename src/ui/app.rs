@@ -1,20 +1,25 @@
 //! TUI application state, keybindings, layout, and rendering.
 
 use crate::agent::AgentEvent;
+use crate::agent::plan::Plan;
 use crate::approval::{ApprovalRequest, ApprovalResponse};
 use crate::config::{ApprovalMode, Config};
 use crate::credentials;
 use crate::event::{Event, SubagentState};
+use crate::provider::Message;
+use crate::state::{
+    SESSION_ACTIVE, SESSION_IDLE, SessionRecord, StateStore, TaskRecord, now_epoch,
+};
 use crate::tools::ToolContext;
 use crate::ui::agents::AgentPane;
-use crate::ui::chat::{ChatState, ToolLogEntry};
+use crate::ui::chat::{ChatItem, ChatState, ReplyStats, ToolLogEntry};
 use crate::ui::diff::DiffPane;
 use crate::ui::plan::PlanPane;
 use crate::ui::theme::{SyntaxEngine, Theme};
 use crate::ui::util::{TextInput, popup_rect, slice_chars, spinner, truncate_chars};
 use crate::ui::worker::{AgentCommand, UiMessage};
 use crate::util::text::one_line;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -32,8 +37,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
+    Sessions,
+    #[default]
     Chat,
     Plan,
     Diff,
@@ -43,21 +50,30 @@ pub enum Focus {
 impl Focus {
     fn next(self) -> Self {
         match self {
-            Focus::Chat => Focus::Plan,
-            Focus::Plan => Focus::Diff,
-            Focus::Diff => Focus::Agents,
-            Focus::Agents => Focus::Chat,
+            Focus::Sessions => Focus::Chat,
+            Focus::Chat => Focus::Diff,
+            Focus::Diff => Focus::Plan,
+            Focus::Plan => Focus::Agents,
+            Focus::Agents => Focus::Sessions,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Focus::Chat => Focus::Agents,
-            Focus::Plan => Focus::Chat,
-            Focus::Diff => Focus::Plan,
-            Focus::Agents => Focus::Diff,
+            Focus::Sessions => Focus::Agents,
+            Focus::Chat => Focus::Sessions,
+            Focus::Diff => Focus::Chat,
+            Focus::Plan => Focus::Diff,
+            Focus::Agents => Focus::Plan,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum MainView {
+    #[default]
+    Chat,
+    Diff,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +83,7 @@ enum Action {
     Settings,
     Sessions,
     NewSession,
+    Tasks,
     Focus(Focus),
     ToolLog,
     ToggleDiffMode,
@@ -86,7 +103,9 @@ impl Action {
             Action::Settings => "Settings: OpenCode API key…".to_string(),
             Action::Sessions => "Sessions: switch / new / delete…".to_string(),
             Action::NewSession => "New session".to_string(),
+            Action::Tasks => "Tasks: list / switch…".to_string(),
             Action::Focus(focus) => match focus {
+                Focus::Sessions => "Focus: sessions".to_string(),
                 Focus::Chat => "Focus: chat".to_string(),
                 Focus::Plan => "Focus: plan".to_string(),
                 Focus::Diff => "Focus: diff".to_string(),
@@ -109,13 +128,22 @@ struct PaletteState {
     selected: usize,
 }
 
-struct ModelPicker {
+#[derive(Debug, Clone)]
+struct ModelChoice {
     provider: String,
-    models: Vec<String>,
-    current: String,
+    model: String,
+    needs_key: bool,
+    current: bool,
+}
+
+struct ModelPicker {
+    entries: Vec<ModelChoice>,
+    errors: Vec<String>,
     input: TextInput,
     selected: usize,
     loading: bool,
+    current_provider: String,
+    current_model: String,
 }
 
 struct ToolsOverlay {
@@ -132,21 +160,16 @@ struct SettingsState {
     status: Option<(String, Color)>,
 }
 
-struct SessionListState {
+struct TaskListState {
+    tasks: Vec<TaskRecord>,
     selected: usize,
-}
-
-enum SessionAction {
-    Switch(String),
-    New,
-    Delete(String),
 }
 
 struct SessionMeta {
     id: String,
     title: String,
     turns: usize,
-    updated: Instant,
+    updated: i64,
 }
 
 struct SessionUiState {
@@ -175,12 +198,38 @@ impl Default for SessionUiState {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct LayoutAreas {
+    sessions: Rect,
     chat: Rect,
     plan: Rect,
-    diff: Rect,
     agents: Rect,
     input: Rect,
+    new_session: Rect,
     status: Rect,
+}
+
+#[derive(Debug)]
+pub struct Bootstrap {
+    pub session_id: String,
+    pub sessions: Vec<SessionRecord>,
+    pub messages: Vec<Message>,
+    pub chat: ChatState,
+    pub tools: Vec<ToolLogEntry>,
+    pub plan: Option<Plan>,
+    pub recovered: Option<String>,
+}
+
+impl Default for Bootstrap {
+    fn default() -> Self {
+        Self {
+            session_id: "default".to_string(),
+            sessions: Vec::new(),
+            messages: Vec::new(),
+            chat: ChatState::new(),
+            tools: Vec::new(),
+            plan: None,
+            recovered: None,
+        }
+    }
 }
 
 struct ApprovalModal {
@@ -196,7 +245,7 @@ enum Overlay {
     Tools(ToolsOverlay),
     PlanEdit(PlanEditState),
     Settings(SettingsState),
-    Sessions(SessionListState),
+    Tasks(TaskListState),
 }
 
 struct Toast {
@@ -209,6 +258,10 @@ pub struct App {
     theme: Theme,
     syntax: SyntaxEngine,
     focus: Focus,
+    main_view: MainView,
+    session_cursor: usize,
+    hovered_session: Option<usize>,
+    marquee_tick: usize,
     chat_insert: bool,
     chat: ChatState,
     tools: Vec<ToolLogEntry>,
@@ -222,6 +275,7 @@ pub struct App {
     ctx: ToolContext,
     config: Config,
     config_path: std::path::PathBuf,
+    store: Option<StateStore>,
     agent_tx: UnboundedSender<AgentCommand>,
     ui_rx: UnboundedReceiver<UiMessage>,
     provider: String,
@@ -242,25 +296,72 @@ pub struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         config_path: std::path::PathBuf,
         ctx: ToolContext,
         provider: String,
         model: String,
+        store: Option<StateStore>,
+        bootstrap: Bootstrap,
         agent_tx: UnboundedSender<AgentCommand>,
         ui_rx: UnboundedReceiver<UiMessage>,
     ) -> Self {
         let theme = Theme::from_name(&config.general.theme);
         let mode = config.general.approval_mode;
+        let mut session_meta: Vec<SessionMeta> = bootstrap
+            .sessions
+            .iter()
+            .map(|session| SessionMeta {
+                id: session.id.clone(),
+                title: session.title.clone(),
+                turns: session.turns,
+                updated: session.updated_at,
+            })
+            .collect();
+        if session_meta.is_empty() {
+            session_meta.push(SessionMeta {
+                id: bootstrap.session_id.clone(),
+                title: "New session".to_string(),
+                turns: 0,
+                updated: now_epoch(),
+            });
+        }
+        if !session_meta
+            .iter()
+            .any(|meta| meta.id == bootstrap.session_id)
+        {
+            session_meta.push(SessionMeta {
+                id: bootstrap.session_id.clone(),
+                title: "Session".to_string(),
+                turns: 0,
+                updated: now_epoch(),
+            });
+        }
+        let current_session = bootstrap.session_id.clone();
+        let mut plan = PlanPane::new();
+        if let Some(saved_plan) = bootstrap.plan.clone() {
+            plan.set_plan(saved_plan);
+            plan.review = false;
+            plan.running = false;
+            plan.pending = false;
+        }
         let mut app = Self {
             theme,
             syntax: SyntaxEngine::new(),
             focus: Focus::Chat,
+            main_view: MainView::Chat,
+            session_cursor: session_meta
+                .iter()
+                .position(|meta| meta.id == current_session)
+                .unwrap_or(0),
+            hovered_session: None,
+            marquee_tick: 0,
             chat_insert: true,
-            chat: ChatState::new(),
-            tools: Vec::new(),
-            plan: PlanPane::new(),
+            chat: bootstrap.chat,
+            tools: bootstrap.tools,
+            plan,
             diff: DiffPane::new(),
             agents: AgentPane::new(),
             input: TextInput::new(),
@@ -270,6 +371,7 @@ impl App {
             ctx,
             config,
             config_path,
+            store,
             agent_tx,
             ui_rx,
             provider,
@@ -277,13 +379,8 @@ impl App {
             mode,
             tokens_in: 0,
             tokens_out: 0,
-            current_session: "default".to_string(),
-            session_meta: vec![SessionMeta {
-                id: "default".to_string(),
-                title: "New session".to_string(),
-                turns: 0,
-                updated: Instant::now(),
-            }],
+            current_session,
+            session_meta,
             session_states: HashMap::new(),
             layout: LayoutAreas::default(),
             turn_started: None,
@@ -306,6 +403,11 @@ impl App {
             app.chat.push_info(format!(
                 "No config at {} — using defaults. Run `palicode config --init` to create one.",
                 app.config_path.display()
+            ));
+        }
+        if let Some(recovered) = bootstrap.recovered {
+            app.chat.push_info(format!(
+                "Recovered interrupted session: {recovered} (press s to switch)"
             ));
         }
         app
@@ -356,6 +458,7 @@ impl App {
 
     fn on_tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
+        self.marquee_tick = self.marquee_tick.wrapping_add(1);
         if let Some(toast) = &self.toast
             && toast.expires <= Instant::now()
         {
@@ -367,7 +470,12 @@ impl App {
             .entries
             .iter()
             .any(|entry| entry.state == SubagentState::Started);
-        if self.busy || agents_running || self.toast.is_some() {
+        if self.busy
+            || agents_running
+            || self.toast.is_some()
+            || self.hovered_session.is_some()
+            || self.focus == Focus::Sessions
+        {
             self.dirty = true;
         }
     }
@@ -393,17 +501,50 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if self.approval.is_some() {
+        if self.approval.is_some() || self.overlay.is_some() {
+            if self.hovered_session.take().is_some() {
+                self.dirty = true;
+            }
             return;
         }
         match mouse.kind {
             MouseEventKind::ScrollUp => self.handle_mouse_scroll(mouse.column, mouse.row, true),
             MouseEventKind::ScrollDown => self.handle_mouse_scroll(mouse.column, mouse.row, false),
+            MouseEventKind::Moved => {
+                let hovered = self.session_index_at(mouse.column, mouse.row);
+                if hovered != self.hovered_session {
+                    self.hovered_session = hovered;
+                    self.marquee_tick = 0;
+                    self.dirty = true;
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.handle_mouse_click(mouse.column, mouse.row)
             }
             _ => {}
         }
+    }
+
+    fn session_index_at(&self, x: u16, y: u16) -> Option<usize> {
+        if !rect_contains(self.layout.sessions, x, y) {
+            return None;
+        }
+        let list_top = self.layout.sessions.y.saturating_add(4);
+        let list_height = self.layout.sessions.height.saturating_sub(5) as usize;
+        if list_height == 0 || y < list_top || y >= list_top + list_height as u16 {
+            return None;
+        }
+        let selected = if self.focus == Focus::Sessions {
+            self.session_cursor
+        } else {
+            self.session_meta
+                .iter()
+                .position(|meta| meta.id == self.current_session)
+                .unwrap_or(0)
+        };
+        let offset = selected.saturating_sub(list_height.saturating_sub(1));
+        let index = offset + (y - list_top) as usize;
+        (index < self.session_meta.len()).then_some(index)
     }
 
     fn handle_mouse_scroll(&mut self, x: u16, y: u16, up: bool) {
@@ -412,13 +553,6 @@ impl App {
             match &mut self.overlay {
                 Some(Overlay::Tools(state)) => {
                     let len = self.tools.len();
-                    if len > 0 {
-                        state.selected =
-                            (state.selected as isize + delta).clamp(0, len as isize - 1) as usize;
-                    }
-                }
-                Some(Overlay::Sessions(state)) => {
-                    let len = self.session_meta.len();
                     if len > 0 {
                         state.selected =
                             (state.selected as isize + delta).clamp(0, len as isize - 1) as usize;
@@ -436,12 +570,20 @@ impl App {
             return;
         }
 
-        if rect_contains(self.layout.chat, x, y) {
-            self.chat.scroll_by(delta * 3);
+        if rect_contains(self.layout.sessions, x, y) {
+            if !self.session_meta.is_empty() {
+                self.session_cursor = (self.session_cursor as isize + delta)
+                    .clamp(0, self.session_meta.len() as isize - 1)
+                    as usize;
+            }
+        } else if rect_contains(self.layout.chat, x, y) {
+            if self.main_view == MainView::Diff {
+                self.diff.next_hunk(delta);
+            } else {
+                self.chat.scroll_by(delta * 3);
+            }
         } else if rect_contains(self.layout.plan, x, y) {
             self.plan.move_cursor(delta);
-        } else if rect_contains(self.layout.diff, x, y) {
-            self.diff.next_hunk(delta);
         } else if rect_contains(self.layout.agents, x, y) {
             self.agents.move_cursor(delta);
         }
@@ -451,19 +593,28 @@ impl App {
         if self.overlay.is_some() {
             return;
         }
-        if rect_contains(self.layout.input, x, y) {
+        if rect_contains(self.layout.new_session, x, y) {
+            self.new_session();
+        } else if rect_contains(self.layout.sessions, x, y) {
+            self.focus_pane(Focus::Sessions, false);
+            if let Some(index) = self.session_index_at(x, y) {
+                self.session_cursor = index;
+            }
+        } else if rect_contains(self.layout.input, x, y) {
             self.focus_pane(Focus::Chat, true);
         } else if rect_contains(self.layout.chat, x, y) {
-            self.focus_pane(Focus::Chat, false);
+            if self.main_view == MainView::Diff {
+                self.focus_pane(Focus::Diff, false);
+                if y > self.layout.chat.y {
+                    self.diff.select_row(y - self.layout.chat.y - 1);
+                }
+            } else {
+                self.focus_pane(Focus::Chat, false);
+            }
         } else if rect_contains(self.layout.plan, x, y) {
             self.focus_pane(Focus::Plan, false);
             if y > self.layout.plan.y {
                 self.plan.select_row(y - self.layout.plan.y - 1);
-            }
-        } else if rect_contains(self.layout.diff, x, y) {
-            self.focus_pane(Focus::Diff, false);
-            if y > self.layout.diff.y {
-                self.diff.select_row(y - self.layout.diff.y - 1);
             }
         } else if rect_contains(self.layout.agents, x, y) {
             self.focus_pane(Focus::Agents, false);
@@ -509,7 +660,7 @@ impl App {
                     state.input.insert(ch);
                 }
             }
-            Some(Overlay::Help) | Some(Overlay::Tools(_)) | Some(Overlay::Sessions(_)) => {}
+            Some(Overlay::Help) | Some(Overlay::Tools(_)) | Some(Overlay::Tasks(_)) => {}
             None => {
                 if self.focus == Focus::Chat && self.chat_insert {
                     for ch in chat_paste.chars() {
@@ -573,12 +724,18 @@ impl App {
         }
 
         if key.code == KeyCode::Tab {
-            let next = self.focus.next();
+            let mut next = self.focus.next();
+            if next == Focus::Plan && !self.plan_visible() {
+                next = next.next();
+            }
             self.focus_pane(next, false);
             return;
         }
         if key.code == KeyCode::BackTab {
-            let previous = self.focus.previous();
+            let mut previous = self.focus.previous();
+            if previous == Focus::Plan && !self.plan_visible() {
+                previous = previous.previous();
+            }
             self.focus_pane(previous, false);
             return;
         }
@@ -631,10 +788,14 @@ impl App {
                 return;
             }
             KeyCode::Char('p') => {
-                self.focus_pane(Focus::Plan, false);
+                if self.plan_visible() {
+                    self.focus_pane(Focus::Plan, false);
+                } else {
+                    self.notify("No plan yet — use /plan <task>", self.theme.palette.warning);
+                }
                 return;
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') if self.focus != Focus::Plan && self.focus != Focus::Sessions => {
                 self.focus_pane(Focus::Diff, false);
                 return;
             }
@@ -647,7 +808,11 @@ impl App {
                 return;
             }
             KeyCode::Char('s') => {
-                self.open_sessions();
+                self.focus_sessions();
+                return;
+            }
+            KeyCode::Char('T') => {
+                self.open_tasks();
                 return;
             }
             KeyCode::Char('n') if self.focus != Focus::Plan => {
@@ -674,6 +839,7 @@ impl App {
         }
 
         match self.focus {
+            Focus::Sessions => self.handle_sessions_key(key),
             Focus::Chat => self.handle_chat_normal(key),
             Focus::Plan => self.handle_plan_key(key),
             Focus::Diff => self.handle_diff_key(key),
@@ -683,8 +849,12 @@ impl App {
 
     fn handle_chat_normal(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('i') | KeyCode::Enter => self.chat_insert = true,
+            KeyCode::Char('i') | KeyCode::Enter => {
+                self.main_view = MainView::Chat;
+                self.chat_insert = true;
+            }
             KeyCode::Char('/') => {
+                self.main_view = MainView::Chat;
                 self.chat_insert = true;
                 self.input.insert('/');
             }
@@ -702,10 +872,14 @@ impl App {
         if self.plan.reorder {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.plan.move_step(1);
+                    if self.plan.move_step(1) {
+                        self.persist_plan();
+                    }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.plan.move_step(-1);
+                    if self.plan.move_step(-1) {
+                        self.persist_plan();
+                    }
                 }
                 KeyCode::Enter | KeyCode::Esc | KeyCode::Char('r') => {
                     self.plan.toggle_reorder();
@@ -724,6 +898,7 @@ impl App {
             KeyCode::Char('r') => self.plan.toggle_reorder(),
             KeyCode::Char('d') => {
                 if self.plan.delete_selected() {
+                    self.persist_plan();
                     self.notify("Removed plan step", self.theme.palette.dim);
                 } else {
                     self.notify("Cannot delete the last step", self.theme.palette.warning);
@@ -770,6 +945,34 @@ impl App {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.agents.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.agents.move_cursor(-1),
+            _ => {}
+        }
+    }
+
+    fn handle_sessions_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.session_meta.is_empty() {
+                    self.session_cursor =
+                        (self.session_cursor + 1).min(self.session_meta.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.session_cursor = self.session_cursor.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if let Some(meta) = self.session_meta.get(self.session_cursor) {
+                    let id = meta.id.clone();
+                    self.switch_session(id);
+                }
+            }
+            KeyCode::Char('n') => self.new_session(),
+            KeyCode::Char('d') => {
+                if let Some(meta) = self.session_meta.get(self.session_cursor) {
+                    let id = meta.id.clone();
+                    self.delete_session(id);
+                }
+            }
             _ => {}
         }
     }
@@ -828,8 +1031,7 @@ impl App {
         };
         let mut close = false;
         let mut action = None;
-        let mut model_to_set = None;
-        let mut session_action = None;
+        let mut model_selection: Option<ModelChoice> = None;
 
         match &mut overlay {
             Overlay::Help => {
@@ -876,7 +1078,7 @@ impl App {
                 let models = filtered_models(picker);
                 match key.code {
                     KeyCode::Enter => {
-                        model_to_set = models.get(picker.selected).cloned();
+                        model_selection = models.get(picker.selected).cloned();
                         close = true;
                     }
                     KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
@@ -931,6 +1133,7 @@ impl App {
                     let index = state.index;
                     let value = state.input.value();
                     if self.plan.edit_description(index, value) {
+                        self.persist_plan();
                         self.notify("Step updated", self.theme.palette.success);
                     } else {
                         self.notify("Description cannot be empty", self.theme.palette.warning);
@@ -951,8 +1154,8 @@ impl App {
                 KeyCode::End => state.input.end(),
                 _ => {}
             },
-            Overlay::Sessions(state) => {
-                let len = self.session_meta.len();
+            Overlay::Tasks(state) => {
+                let len = state.tasks.len();
                 match key.code {
                     KeyCode::Char('j') | KeyCode::Down => {
                         if len > 0 {
@@ -963,18 +1166,11 @@ impl App {
                         state.selected = state.selected.saturating_sub(1);
                     }
                     KeyCode::Enter => {
-                        if let Some(meta) = self.session_meta.get(state.selected) {
-                            session_action = Some(SessionAction::Switch(meta.id.clone()));
+                        if let Some(task) = state.tasks.get(state.selected) {
+                            self.plan.cursor = task.index;
+                            self.focus_pane(Focus::Plan, false);
                             close = true;
-                        }
-                    }
-                    KeyCode::Char('n') => {
-                        session_action = Some(SessionAction::New);
-                        close = true;
-                    }
-                    KeyCode::Char('d') => {
-                        if let Some(meta) = self.session_meta.get(state.selected) {
-                            session_action = Some(SessionAction::Delete(meta.id.clone()));
+                            self.status_text = format!("task: {}", task.title);
                         }
                     }
                     _ => {}
@@ -1044,18 +1240,22 @@ impl App {
         if let Some(action) = action {
             self.perform_action(action);
         }
-        if let Some(model) = model_to_set {
-            self.send(AgentCommand::SetModel(model.clone()));
-            self.notify(
-                format!("Switching model to {model}…"),
-                self.theme.palette.accent,
-            );
-        }
-        if let Some(action) = session_action {
-            match action {
-                SessionAction::Switch(id) => self.switch_session(id),
-                SessionAction::New => self.new_session(),
-                SessionAction::Delete(id) => self.delete_session(id),
+        if let Some(choice) = model_selection {
+            if choice.provider == self.provider {
+                self.send(AgentCommand::SetModel(choice.model.clone()));
+                self.notify(
+                    format!("Switching model to {}…", choice.model),
+                    self.theme.palette.accent,
+                );
+            } else {
+                self.send(AgentCommand::SetProviderModel {
+                    provider: choice.provider.clone(),
+                    model: choice.model.clone(),
+                });
+                self.notify(
+                    format!("Switching to {}/{}…", choice.provider, choice.model),
+                    self.theme.palette.accent,
+                );
             }
         }
     }
@@ -1217,14 +1417,15 @@ impl App {
             return;
         }
         self.overlay = Some(Overlay::Models(ModelPicker {
-            provider: self.provider.clone(),
-            models: Vec::new(),
-            current: self.model.clone(),
+            entries: Vec::new(),
+            errors: Vec::new(),
             input: TextInput::new(),
             selected: 0,
             loading: true,
+            current_provider: self.provider.clone(),
+            current_model: self.model.clone(),
         }));
-        self.send(AgentCommand::ListModels);
+        self.send(AgentCommand::ListAllModels);
     }
 
     fn open_palette(&mut self) {
@@ -1296,11 +1497,143 @@ impl App {
         {
             meta.title = "New session".to_string();
             meta.turns = 0;
-            meta.updated = Instant::now();
+            meta.updated = now_epoch();
+        }
+        if let Some(store) = &self.store {
+            let _ = store.update_session_meta(&self.current_session, "New session", 0);
+            let _ = store.clear_plan(&self.current_session);
         }
         self.send(AgentCommand::ClearHistory);
+        self.main_view = MainView::Chat;
+        self.focus_pane(Focus::Chat, true);
         self.notify("Conversation cleared", self.theme.palette.dim);
         self.status_text = "ready".to_string();
+    }
+
+    pub fn shutdown(&mut self) {
+        let title = self.current_session_title();
+        let turns = self
+            .session_meta
+            .iter()
+            .find(|meta| meta.id == self.current_session)
+            .map(|meta| meta.turns)
+            .unwrap_or(0);
+        if let Some(store) = &self.store {
+            let _ = store.update_session_meta(&self.current_session, &title, turns);
+            if let Some(plan) = &self.plan.plan {
+                let _ = store.save_plan(&self.current_session, plan);
+            }
+            let _ = store.set_status(&self.current_session, SESSION_IDLE);
+        }
+        if self.config.general.handoff_on_exit
+            && (self.plan.plan.is_some()
+                || self
+                    .chat
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, ChatItem::User(_))))
+            && let Err(err) = self.write_handoff()
+        {
+            eprintln!("warning: cannot write HANDOFF.md: {err:#}");
+        }
+    }
+
+    fn write_handoff(&self) -> Result<()> {
+        let goal = self
+            .plan
+            .plan
+            .as_ref()
+            .map(|plan| plan.goal.clone())
+            .or_else(|| {
+                self.chat.items.iter().find_map(|item| match item {
+                    ChatItem::User(text) => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| "(not recorded)".to_string());
+
+        let mut content = String::new();
+        content.push_str("# palicode handoff\n\n");
+        content.push_str(&format!(
+            "Session: {} (`{}`)\n",
+            self.current_session_title(),
+            self.current_session
+        ));
+        content.push_str(&format!("Provider: {} / {}\n", self.provider, self.model));
+        content.push_str(&format!("Working directory: {}\n", self.ctx.cwd.display()));
+        content.push_str(&format!("Approval mode: {}\n\n", self.mode));
+        content.push_str("## Goal\n\n");
+        content.push_str(&goal);
+        content.push_str("\n\n");
+
+        if let Some(plan) = &self.plan.plan {
+            content.push_str("## Plan\n\n");
+            for (index, step) in plan.steps.iter().enumerate() {
+                content.push_str(&format!(
+                    "{:>2}. {} {}\n",
+                    index + 1,
+                    step.status.icon(),
+                    step.description
+                ));
+            }
+            content.push('\n');
+        }
+
+        content.push_str("## Recent conversation\n\n");
+        let recent: Vec<&ChatItem> = self
+            .chat
+            .items
+            .iter()
+            .filter(|item| matches!(item, ChatItem::User(_) | ChatItem::Assistant(_)))
+            .rev()
+            .take(8)
+            .collect();
+        for item in recent.into_iter().rev() {
+            match item {
+                ChatItem::User(text) => {
+                    content.push_str("**user:** ");
+                    content.push_str(&truncate_chars(text, 1_200));
+                    content.push_str("\n\n");
+                }
+                ChatItem::Assistant(text) => {
+                    content.push_str("**assistant:** ");
+                    content.push_str(&truncate_chars(text, 1_200));
+                    content.push_str("\n\n");
+                }
+                _ => {}
+            }
+        }
+
+        content.push_str("## Tools\n\n");
+        for tool in self.tools.iter().rev().take(12).rev() {
+            content.push_str(&format!(
+                "- {} {} {}\n",
+                if tool.output.is_empty() {
+                    "·"
+                } else if tool.is_error {
+                    "✗"
+                } else {
+                    "✓"
+                },
+                tool.name,
+                one_line(&tool.arguments, 160)
+            ));
+        }
+        content.push('\n');
+
+        content.push_str("## Resume\n\n");
+        content.push_str(&format!(
+            "```bash\npalicode resume {}\n```\n",
+            self.current_session
+        ));
+
+        let path = self.ctx.cwd.join("HANDOFF.md");
+        std::fs::write(&path, content)
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        if let Some(store) = &self.store {
+            let _ = store.save_handoff(&self.current_session, &path.display().to_string(), &goal);
+        }
+        Ok(())
     }
 
     fn current_session_title(&self) -> String {
@@ -1322,27 +1655,45 @@ impl App {
             if first || meta.title == "New session" {
                 meta.title = truncate_chars(&one_line(prompt, 48), 48);
             }
-            meta.updated = Instant::now();
+            meta.updated = now_epoch();
+            if let Some(store) = &self.store {
+                let _ = store.update_session_meta(&self.current_session, &meta.title, meta.turns);
+            }
         }
     }
 
-    fn open_sessions(&mut self) {
-        if self.busy {
+    fn open_tasks(&mut self) {
+        let Some(store) = &self.store else {
             self.notify(
-                "Wait for the current turn to finish",
+                "Tasks require durable state (database unavailable)",
                 self.theme.palette.warning,
             );
             return;
+        };
+        match store.list_tasks(&self.current_session) {
+            Ok(tasks) if tasks.is_empty() => self.notify(
+                "No tasks yet — generate a plan first",
+                self.theme.palette.warning,
+            ),
+            Ok(tasks) => {
+                self.overlay = Some(Overlay::Tasks(TaskListState { tasks, selected: 0 }));
+            }
+            Err(err) => self.error(format!("cannot load tasks: {err:#}")),
         }
-        let selected = self
-            .session_meta
-            .iter()
-            .position(|meta| meta.id == self.current_session)
-            .unwrap_or(0);
-        self.overlay = Some(Overlay::Sessions(SessionListState { selected }));
+    }
+
+    fn persist_plan(&self) {
+        if let (Some(store), Some(plan)) = (&self.store, &self.plan.plan) {
+            let _ = store.save_plan(&self.current_session, plan);
+        }
     }
 
     fn stash_current_state(&mut self) {
+        if let Some(store) = &self.store
+            && let Some(plan) = &self.plan.plan
+        {
+            let _ = store.save_plan(&self.current_session, plan);
+        }
         let state = SessionUiState {
             chat: std::mem::replace(&mut self.chat, ChatState::new()),
             tools: std::mem::take(&mut self.tools),
@@ -1374,17 +1725,38 @@ impl App {
             );
             return;
         }
+        let previous = self.current_session.clone();
+        if let Some(store) = &self.store {
+            let _ = store.set_status(&previous, SESSION_IDLE);
+        }
         self.stash_current_state();
         let id = uuid::Uuid::new_v4().to_string();
+        let now = now_epoch();
+        if let Some(store) = &self.store {
+            let record = SessionRecord {
+                id: id.clone(),
+                title: "New session".to_string(),
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+                cwd: self.ctx.cwd.display().to_string(),
+                status: SESSION_ACTIVE.to_string(),
+                turns: 0,
+                created_at: now,
+                updated_at: now,
+            };
+            let _ = store.insert_session(&record);
+        }
         self.current_session = id.clone();
         self.session_meta.push(SessionMeta {
             id: id.clone(),
             title: "New session".to_string(),
             turns: 0,
-            updated: Instant::now(),
+            updated: now,
         });
+        self.session_cursor = self.session_meta.len() - 1;
         self.install_ui_state(SessionUiState::default());
         self.input.clear();
+        self.hovered_session = None;
         self.send(AgentCommand::NewSession(id));
         self.overlay = None;
         self.focus_pane(Focus::Chat, true);
@@ -1412,18 +1784,54 @@ impl App {
             .find(|meta| meta.id == id)
             .map(|meta| meta.title.clone())
             .unwrap_or_else(|| "Session".to_string());
+        let previous = self.current_session.clone();
+        if let Some(store) = &self.store {
+            let _ = store.set_status(&previous, SESSION_IDLE);
+            let _ = store.set_active_session(&id);
+        }
         self.stash_current_state();
+        if !self.session_states.contains_key(&id)
+            && let Some(store) = &self.store
+            && let Ok(messages) = store.load_messages(&id)
+        {
+            let (chat, tools) = ChatState::restore(&messages);
+            let mut plan = PlanPane::new();
+            if let Ok(Some(saved_plan)) = store.load_plan(&id) {
+                plan.set_plan(saved_plan);
+                plan.review = false;
+                plan.running = false;
+                plan.pending = false;
+            }
+            self.session_states.insert(
+                id.clone(),
+                SessionUiState {
+                    chat,
+                    tools,
+                    plan,
+                    diff: DiffPane::new(),
+                    agents: AgentPane::new(),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                },
+            );
+        }
         self.current_session = id.clone();
+        self.session_cursor = self
+            .session_meta
+            .iter()
+            .position(|meta| meta.id == id)
+            .unwrap_or(0);
         let state = self.session_states.remove(&id).unwrap_or_default();
         self.install_ui_state(state);
         self.input.clear();
+        self.hovered_session = None;
         self.send(AgentCommand::SwitchSession(id));
         if let Some(meta) = self
             .session_meta
             .iter_mut()
             .find(|meta| meta.id == self.current_session)
         {
-            meta.updated = Instant::now();
+            meta.updated = now_epoch();
         }
         self.overlay = None;
         self.focus_pane(Focus::Chat, false);
@@ -1450,22 +1858,48 @@ impl App {
         }
         self.session_meta.retain(|meta| meta.id != id);
         self.session_states.remove(&id);
-        self.send(AgentCommand::DeleteSession(id));
-        if let Some(Overlay::Sessions(state)) = &mut self.overlay {
-            state.selected = state
-                .selected
-                .min(self.session_meta.len().saturating_sub(1));
+        self.hovered_session = None;
+        if let Some(store) = &self.store {
+            let _ = store.delete_session(&id);
         }
+        self.send(AgentCommand::DeleteSession(id));
+        self.session_cursor = self
+            .session_cursor
+            .min(self.session_meta.len().saturating_sub(1));
         self.notify("Session deleted", self.theme.palette.dim);
     }
 
     fn focus_pane(&mut self, focus: Focus, insert: bool) {
         self.focus = focus;
-        if focus == Focus::Chat {
-            self.chat_insert = insert;
-        } else {
-            self.chat_insert = false;
+        match focus {
+            Focus::Chat => {
+                self.main_view = MainView::Chat;
+                self.chat_insert = insert;
+            }
+            Focus::Diff => {
+                self.main_view = MainView::Diff;
+                self.chat_insert = false;
+            }
+            _ => {
+                self.chat_insert = false;
+            }
         }
+    }
+
+    fn plan_visible(&self) -> bool {
+        self.plan.pending || self.plan.plan.is_some()
+    }
+
+    fn focus_sessions(&mut self) {
+        self.session_cursor = self
+            .session_meta
+            .iter()
+            .position(|meta| meta.id == self.current_session)
+            .unwrap_or_else(|| {
+                self.session_cursor
+                    .min(self.session_meta.len().saturating_sub(1))
+            });
+        self.focus_pane(Focus::Sessions, false);
     }
 
     fn perform_action(&mut self, action: Action) {
@@ -1476,8 +1910,9 @@ impl App {
             }
             Action::PickModel => self.open_models(),
             Action::Settings => self.open_settings(),
-            Action::Sessions => self.open_sessions(),
+            Action::Sessions => self.focus_sessions(),
             Action::NewSession => self.new_session(),
+            Action::Tasks => self.open_tasks(),
             Action::Focus(focus) => self.focus_pane(focus, focus == Focus::Chat),
             Action::ToolLog => self.open_tools(),
             Action::ToggleDiffMode => {
@@ -1529,6 +1964,7 @@ impl App {
             Action::Settings,
             Action::Sessions,
             Action::NewSession,
+            Action::Tasks,
             Action::Focus(Focus::Chat),
             Action::Focus(Focus::Plan),
             Action::Focus(Focus::Diff),
@@ -1598,17 +2034,44 @@ impl App {
                 });
                 self.status_text = "approval required".to_string();
             }
-            UiMessage::Models {
-                provider,
-                current,
-                models,
+            UiMessage::ModelGroups {
+                current_provider,
+                current_model,
+                groups,
             } => {
+                let mut entries = Vec::new();
+                let mut errors = Vec::new();
+                for group in groups {
+                    if let Some(error) = &group.error {
+                        errors.push(format!("{}: {error}", group.provider));
+                    }
+                    if !group.has_credentials && group.error.is_none() {
+                        errors.push(format!(
+                            "{}: no API key (models listed; chat needs a key)",
+                            group.provider
+                        ));
+                    }
+                    for model in group.models {
+                        entries.push(ModelChoice {
+                            current: group.provider == current_provider && model == current_model,
+                            provider: group.provider.clone(),
+                            model,
+                            needs_key: !group.has_credentials,
+                        });
+                    }
+                }
+                entries.sort_by(|left, right| {
+                    left.provider
+                        .cmp(&right.provider)
+                        .then_with(|| left.model.cmp(&right.model))
+                });
                 if let Some(Overlay::Models(picker)) = &mut self.overlay {
-                    picker.provider = provider;
-                    picker.current = current;
-                    picker.models = models;
+                    picker.entries = entries;
+                    picker.errors = errors;
                     picker.loading = false;
                     picker.selected = 0;
+                    picker.current_provider = current_provider;
+                    picker.current_model = current_model;
                 }
             }
             UiMessage::ModelChanged { provider, model } => {
@@ -1646,25 +2109,34 @@ impl App {
                 if self.plan.pending {
                     self.plan.pending = false;
                 }
+                if self.focus == Focus::Plan && !self.plan_visible() {
+                    self.focus_pane(Focus::Chat, false);
+                }
                 if self.status_text != "ready" {
                     self.status_text = "ready".to_string();
                 }
             }
             UiMessage::PlanFinished(outcome) => {
                 self.plan.finish();
+                let verification = match outcome.verified {
+                    Some(true) => " · verified",
+                    Some(false) => " · verification failed",
+                    None => "",
+                };
                 let summary = format!(
-                    "Plan: {} done, {} failed, {} skipped",
+                    "Plan: {} done, {} failed, {} skipped{verification}",
                     outcome.done, outcome.failed, outcome.skipped
                 );
+                let failed = outcome.failed > 0 || outcome.verified == Some(false);
                 self.notify(
                     summary,
-                    if outcome.failed > 0 {
+                    if failed {
                         self.theme.palette.error
                     } else {
                         self.theme.palette.success
                     },
                 );
-                if outcome.failed > 0 {
+                if failed {
                     self.focus_pane(Focus::Plan, false);
                 }
             }
@@ -1747,6 +2219,8 @@ impl App {
             }
             AgentEvent::Diff { tool, diff } => match self.diff.ingest(&tool, &diff) {
                 Ok(count) => {
+                    self.main_view = MainView::Diff;
+                    self.focus_pane(Focus::Diff, false);
                     self.status_text = format!("diff: {count} file(s)");
                 }
                 Err(err) => {
@@ -1757,6 +2231,28 @@ impl App {
             AgentEvent::Usage(usage) => {
                 self.tokens_in = self.tokens_in.saturating_add(usage.prompt_tokens);
                 self.tokens_out = self.tokens_out.saturating_add(usage.completion_tokens);
+            }
+            AgentEvent::ResponseStats {
+                duration_ms,
+                completion_tokens,
+                estimated,
+                model,
+            } => {
+                let index = self
+                    .chat
+                    .streaming
+                    .or_else(|| self.chat.last_assistant_index());
+                if let Some(index) = index {
+                    self.chat.set_assistant_stats(
+                        index,
+                        ReplyStats {
+                            duration_ms,
+                            completion_tokens,
+                            estimated,
+                            model,
+                        },
+                    );
+                }
             }
             AgentEvent::StepLimit { steps } => {
                 self.chat
@@ -1793,6 +2289,9 @@ impl App {
                 description,
             } => {
                 self.plan.update_step(index, status);
+                if let Some(store) = &self.store {
+                    let _ = store.update_task_status(&self.current_session, index, status);
+                }
                 if status == crate::agent::plan::StepStatus::Running {
                     self.status_text = format!("plan step: {description}");
                 }
@@ -1845,8 +2344,8 @@ impl App {
             area,
         );
 
-        if area.width < 70 || area.height < 20 {
-            let message = Paragraph::new("Terminal too small (minimum 70×20)")
+        if area.width < 100 || area.height < 22 {
+            let message = Paragraph::new("Terminal too small (minimum 100×22)")
                 .style(Style::default().fg(self.theme.palette.warning))
                 .alignment(ratatui::layout::Alignment::Center);
             let popup = popup_rect(area, 80, 20);
@@ -1857,21 +2356,14 @@ impl App {
 
         let outer = Layout::vertical([Constraint::Min(10), Constraint::Length(1)]).split(area);
         let main = Layout::horizontal([
+            Constraint::Percentage(18),
+            Constraint::Length(1),
             Constraint::Percentage(62),
             Constraint::Length(1),
-            Constraint::Percentage(37),
+            Constraint::Percentage(18),
         ])
         .split(outer[0]);
-        let chat_areas =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(main[0]);
-        let right = Layout::vertical([
-            Constraint::Percentage(42),
-            Constraint::Percentage(43),
-            Constraint::Percentage(15),
-        ])
-        .split(main[2]);
-
-        let separator: Vec<Line> = (0..main[1].height)
+        let separator: Vec<Line> = (0..outer[0].height)
             .map(|_| {
                 Line::from(Span::styled(
                     "│",
@@ -1879,20 +2371,34 @@ impl App {
                 ))
             })
             .collect();
-        frame.render_widget(Paragraph::new(Text::from(separator)), main[1]);
+        for column in [main[1], main[3]] {
+            frame.render_widget(Paragraph::new(Text::from(separator.clone())), column);
+        }
 
         self.layout = LayoutAreas {
-            chat: chat_areas[0],
-            plan: right[0],
-            diff: right[1],
-            agents: right[2],
-            input: chat_areas[1],
+            sessions: main[0],
+            chat: main[2],
+            plan: Rect::default(),
+            agents: main[4],
+            input: Rect::default(),
+            new_session: Rect::default(),
             status: outer[1],
         };
-        self.render_chat(frame, chat_areas[0], chat_areas[1]);
-        self.render_plan(frame, right[0]);
-        self.render_diff(frame, right[1]);
-        self.render_agents(frame, right[2]);
+        self.render_sessions_sidebar(frame, main[0]);
+        match self.main_view {
+            MainView::Chat => self.render_main_chat(frame, main[2]),
+            MainView::Diff => self.render_diff(frame, main[2]),
+        }
+        if self.plan_visible() {
+            let right = Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)])
+                .split(main[4]);
+            self.layout.plan = right[0];
+            self.layout.agents = right[1];
+            self.render_plan(frame, right[0]);
+            self.render_agents(frame, right[1]);
+        } else {
+            self.render_agents(frame, main[4]);
+        }
         self.render_status(frame, outer[1]);
 
         if let Some(overlay) = &self.overlay {
@@ -1903,7 +2409,7 @@ impl App {
                 Overlay::Tools(state) => self.render_tools(frame, state),
                 Overlay::PlanEdit(state) => self.render_plan_edit(frame, state),
                 Overlay::Settings(state) => self.render_settings(frame, state),
-                Overlay::Sessions(state) => self.render_sessions(frame, state),
+                Overlay::Tasks(state) => self.render_tasks(frame, state),
             }
         }
 
@@ -1912,28 +2418,241 @@ impl App {
         }
     }
 
-    fn render_chat(&mut self, frame: &mut Frame, area: Rect, input_area: Rect) {
+    fn render_sessions_sidebar(&mut self, frame: &mut Frame, area: Rect) {
+        let focused = self.focus == Focus::Sessions;
+        let inner = pane(frame, area, "Project", focused, &self.theme);
+        let sections = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+        let project = self
+            .ctx
+            .cwd
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.ctx.cwd.display().to_string());
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(Span::styled(
+                    truncate_chars(&project, sections[0].width as usize),
+                    Style::default()
+                        .fg(self.theme.palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    truncate_chars(
+                        &self.ctx.cwd.display().to_string(),
+                        sections[0].width as usize,
+                    ),
+                    self.theme.dim(),
+                )),
+            ])),
+            sections[0],
+        );
+        let header =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(3)]).split(sections[1]);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_chars(
+                    &format!("Sessions · {}", self.session_meta.len()),
+                    header[0].width as usize,
+                ),
+                self.theme.dim(),
+            ))),
+            header[0],
+        );
+        self.layout.new_session = header[1];
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " + ",
+                Style::default()
+                    .fg(self.theme.palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .alignment(ratatui::layout::Alignment::Center),
+            header[1],
+        );
+
+        let selected = if focused {
+            self.session_cursor
+        } else {
+            self.session_meta
+                .iter()
+                .position(|meta| meta.id == self.current_session)
+                .unwrap_or(0)
+        };
+        let height = sections[2].height as usize;
+        let offset = selected.saturating_sub(height.saturating_sub(1));
+        let available = sections[2].width.saturating_sub(2) as usize;
+        let mut lines = Vec::new();
+        for (index, meta) in self
+            .session_meta
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(height)
+        {
+            let current = meta.id == self.current_session;
+            let is_selected = focused && index == self.session_cursor;
+            let style = if is_selected {
+                Style::default()
+                    .bg(self.theme.palette.selection_bg)
+                    .fg(self.theme.palette.fg)
+            } else if current {
+                Style::default()
+                    .fg(self.theme.palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                self.theme.text()
+            };
+            let age = now_epoch().saturating_sub(meta.updated).max(0);
+            let when = if age < 60 {
+                format!("{age}s")
+            } else if age < 3_600 {
+                format!("{}m", age / 60)
+            } else {
+                format!("{}h", age / 3_600)
+            };
+            let label = format!("{}  ({}t, {when})", meta.title, meta.turns);
+            let animate =
+                self.hovered_session == Some(index) || (focused && self.session_cursor == index);
+            let shown = if animate {
+                marquee_text(&label, self.marquee_tick, available)
+            } else {
+                truncate_chars(&label, available)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{} {shown}", if current { "*" } else { " " }),
+                style,
+            )));
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled("No sessions", self.theme.dim())));
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)), sections[2]);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "n new · Enter open · d delete",
+                self.theme.dim(),
+            ))),
+            sections[3],
+        );
+    }
+
+    fn render_main_chat(&mut self, frame: &mut Frame, area: Rect) {
+        if !self.chat.has_conversation() && self.main_view == MainView::Chat {
+            self.render_welcome(frame, area);
+            return;
+        }
+
+        let sections = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
+        self.layout.input = sections[1];
         let focused = self.focus == Focus::Chat;
         let title = if focused && self.chat_insert {
             "Chat · INSERT"
         } else if focused {
             "Chat · NORMAL"
-        } else {
+        } else if self.diff.files.is_empty() {
             "Chat"
+        } else {
+            "Chat · d: diff"
         };
-        let inner = pane(frame, area, title, focused, &self.theme);
+        let inner = pane(frame, sections[0], title, focused, &self.theme);
         self.chat.viewport_height = inner.height;
-        let width = inner.width.max(1);
-        let lines = self.chat.build_lines(width, &self.tools, &self.theme);
-        let paragraph = Paragraph::new(Text::from(lines))
-            .style(self.theme.text())
-            .scroll((self.chat.scroll, 0));
-        frame.render_widget(paragraph, inner);
+        let lines = self
+            .chat
+            .build_lines(inner.width.max(1), &self.tools, &self.theme);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(self.theme.text())
+                .scroll((self.chat.scroll, 0)),
+            inner,
+        );
+        self.render_input(
+            frame,
+            sections[1],
+            focused && self.chat_insert,
+            "Ask anything, or /plan <task>…",
+        );
+        self.render_input_meta(frame, sections[1]);
+    }
 
-        let input_focused = focused && self.chat_insert;
+    fn render_welcome(&mut self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "palicode",
+                Style::default()
+                    .fg(self.theme.palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .alignment(ratatui::layout::Alignment::Center),
+            rows[1],
+        );
+        let centered = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Percentage(64),
+            Constraint::Fill(1),
+        ])
+        .split(rows[3]);
+        self.layout.input = centered[1];
+        self.render_input(
+            frame,
+            centered[1],
+            self.focus == Focus::Chat && self.chat_insert,
+            "Ask palicode…  (/plan <task>)",
+        );
+        self.render_input_meta(frame, centered[1]);
+    }
+
+    fn render_input_meta(&self, frame: &mut Frame, input_area: Rect) {
+        if input_area.width < 4 || input_area.height == 0 {
+            return;
+        }
+        let meta = Rect {
+            x: input_area.x.saturating_add(1),
+            y: input_area.y.saturating_add(input_area.height),
+            width: input_area.width.saturating_sub(2),
+            height: 2,
+        };
+        if meta.y >= frame.area().bottom() {
+            return;
+        }
+        let mode = if self.chat_insert { "INSERT" } else { "NORMAL" };
+        let identity = format!(
+            "{} · {} · {}/{}",
+            mode, self.mode, self.provider, self.model
+        );
+        let tokens = format!(
+            "{} tok  ·  Ctrl+K commands",
+            format_tokens(self.tokens_in + self.tokens_out)
+        );
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(Span::styled(identity, self.theme.dim())),
+                Line::from(Span::styled(tokens, self.theme.dim())),
+            ])),
+            meta,
+        );
+    }
+
+    fn render_input(&mut self, frame: &mut Frame, area: Rect, focused: bool, placeholder: &str) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(if input_focused {
+            .border_style(Style::default().fg(if focused {
                 self.theme.palette.border_focus
             } else {
                 self.theme.palette.border
@@ -1941,35 +2660,36 @@ impl App {
             .style(Style::default().bg(self.theme.palette.input_bg))
             .title(Span::styled(
                 " Message ",
-                Style::default().fg(if input_focused {
+                Style::default().fg(if focused {
                     self.theme.palette.accent
                 } else {
                     self.theme.palette.dim
                 }),
             ));
-        let input_inner = block.inner(input_area);
-        frame.render_widget(block, input_area);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
 
-        let (text, cursor_col) = self
-            .input
-            .window(input_inner.width.saturating_sub(1) as usize);
+        let (text, cursor_col) = self.input.window(inner.width.saturating_sub(1) as usize);
         if text.is_empty() {
             let placeholder = if self.chat_insert {
-                "Ask anything, or /plan <task>…"
+                placeholder
             } else {
                 "i or Enter to type · Ctrl+K for commands"
             };
             frame.render_widget(
-                Paragraph::new(truncate_chars(placeholder, input_inner.width as usize))
+                Paragraph::new(truncate_chars(placeholder, inner.width as usize))
                     .style(self.theme.dim()),
-                input_inner,
+                inner,
             );
         } else {
-            frame.render_widget(Paragraph::new(text).style(self.theme.text()), input_inner);
+            frame.render_widget(Paragraph::new(text).style(self.theme.text()), inner);
         }
-        if input_focused && input_inner.width > 0 {
-            let x = (input_inner.x + cursor_col as u16).min(input_inner.right().saturating_sub(1));
-            frame.set_cursor_position(Position::new(x, input_inner.y));
+        if focused && self.chat_insert {
+            let x = (inner.x + cursor_col as u16).min(inner.right().saturating_sub(1));
+            frame.set_cursor_position(Position::new(x, inner.y));
         }
     }
 
@@ -1995,8 +2715,8 @@ impl App {
     fn render_diff(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Diff;
         let title = match self.diff.mode {
-            crate::ui::diff::DiffMode::Unified => "Diff · unified",
-            crate::ui::diff::DiffMode::Split => "Diff · split",
+            crate::ui::diff::DiffMode::Unified => "Diff · unified · c: chat",
+            crate::ui::diff::DiffMode::Split => "Diff · split · c: chat",
         };
         let inner = pane(frame, area, title, focused, &self.theme);
         let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
@@ -2056,6 +2776,7 @@ impl App {
             }
         } else {
             match self.focus {
+                Focus::Sessions => "SESSIONS",
                 Focus::Plan => "PLAN",
                 Focus::Diff => "DIFF",
                 Focus::Agents => "AGENTS",
@@ -2070,19 +2791,6 @@ impl App {
                 .fg(palette.bg)
                 .add_modifier(Modifier::BOLD),
         )];
-        spans.push(Span::styled(
-            format!(" {}/{} ", self.provider, self.model),
-            Style::default().fg(palette.fg),
-        ));
-        spans.push(Span::styled(
-            format!(
-                "· {} · {} tok ",
-                self.mode,
-                format_tokens(self.tokens_in + self.tokens_out)
-            ),
-            Style::default().fg(palette.dim),
-        ));
-
         spans.push(Span::styled(
             format!("· {} ", truncate_chars(&self.current_session_title(), 28)),
             Style::default().fg(palette.dim),
@@ -2143,17 +2851,54 @@ impl App {
     }
 
     fn render_help(&self, frame: &mut Frame) {
-        let popup = popup_rect(frame.area(), 72, 72);
+        let popup = popup_rect(frame.area(), 75, 80);
         let inner = popup_block(frame, popup, "Help", &self.theme);
+        let credentials_path = credentials::path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "credentials.toml".to_string());
+        let sandbox = self
+            .ctx
+            .sandbox_root
+            .as_ref()
+            .map(|root| root.display().to_string())
+            .unwrap_or_else(|| "(disabled)".to_string());
+        let db_path = self
+            .store
+            .as_ref()
+            .map(|store| store.path().display().to_string())
+            .unwrap_or_else(|| "(disabled)".to_string());
+        let theme_name = if self.theme.mode == crate::ui::theme::ThemeMode::Dark {
+            "mono-dark"
+        } else {
+            "mono-light"
+        };
+        let config_hint = format!(
+            "config: {}  ·  db: {}  ·  theme: {}  ·  sandbox: {}  ·  credentials: {}",
+            self.config_path.display(),
+            db_path,
+            theme_name,
+            sandbox,
+            credentials_path
+        );
         let text = vec![
             help_line(
                 "Global",
-                "Ctrl+K palette · Tab/Shift+Tab focus · Ctrl+C quit",
+                "Ctrl+K palette · F1 help · F2 settings · Tab focus · Ctrl+C quit",
                 &self.theme,
             ),
             help_line(
                 "Chat",
                 "Esc normal · i/Enter insert · Enter send · j/k scroll · g/G top/bottom",
+                &self.theme,
+            ),
+            help_line(
+                "Sessions",
+                "s list · n new · Enter switch · d delete · durable resume",
+                &self.theme,
+            ),
+            help_line(
+                "Tasks",
+                "T list persisted plan tasks · Enter jump to step",
                 &self.theme,
             ),
             help_line(
@@ -2173,10 +2918,20 @@ impl App {
             ),
             help_line(
                 "Chat commands",
-                "/plan <task> · /mode [mode] · /model · /clear · /help · /quit",
+                "/plan <task> · /mode [mode] · /model · /settings · /clear · /help · /quit",
                 &self.theme,
             ),
+            help_line(
+                "Settings",
+                "F2 OpenCode API key · stored in credentials.toml with mode 0600",
+                &self.theme,
+            ),
+            help_line("Config", &config_hint, &self.theme),
             Line::from(""),
+            Line::from(Span::styled(
+                "Mouse: click to focus panes; wheel scrolls chat / plan / diff / agents.",
+                self.theme.dim(),
+            )),
             Line::from(Span::styled("Esc or ? closes this help.", self.theme.dim())),
         ];
         frame.render_widget(
@@ -2259,13 +3014,13 @@ impl App {
     }
 
     fn render_models(&self, frame: &mut Frame, picker: &ModelPicker) {
-        let popup = popup_rect(frame.area(), 56, 64);
-        let title = format!("Models · {}", picker.provider);
-        let inner = popup_block(frame, popup, &title, &self.theme);
+        let popup = popup_rect(frame.area(), 64, 70);
+        let inner = popup_block(frame, popup, "Models · all providers", &self.theme);
         let sections = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -2317,9 +3072,8 @@ impl App {
                 self.theme.dim(),
             )));
         } else {
-            for (index, model) in models.iter().enumerate().skip(offset).take(height) {
+            for (index, choice) in models.iter().enumerate().skip(offset).take(height) {
                 let selected = index == picker.selected;
-                let current = model == &picker.current;
                 let style = if selected {
                     Style::default()
                         .bg(self.theme.palette.selection_bg)
@@ -2327,16 +3081,38 @@ impl App {
                 } else {
                     self.theme.text()
                 };
+                let marker = if choice.current {
+                    " * "
+                } else if choice.needs_key {
+                    " ! "
+                } else {
+                    "   "
+                };
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        if current { " * " } else { "   " },
-                        style.fg(self.theme.palette.success),
-                    ),
-                    Span::styled(model.clone(), style),
+                    Span::styled(marker, style.fg(self.theme.palette.success)),
+                    Span::styled(format!("{}/{}", choice.provider, choice.model), style),
                 ]));
             }
         }
         frame.render_widget(Paragraph::new(Text::from(lines)), sections[2]);
+
+        let footer = picker.errors.first().cloned().unwrap_or_else(|| {
+            format!(
+                "current: {}/{} · Enter switch · Esc close · ! = key required",
+                picker.current_provider, picker.current_model
+            )
+        });
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_chars(&footer, sections[3].width as usize),
+                if picker.errors.is_empty() {
+                    self.theme.dim()
+                } else {
+                    Style::default().fg(self.theme.palette.warning)
+                },
+            ))),
+            sections[3],
+        );
     }
 
     fn render_tools(&self, frame: &mut Frame, state: &ToolsOverlay) {
@@ -2540,58 +3316,50 @@ impl App {
         );
     }
 
-    fn render_sessions(&self, frame: &mut Frame, state: &SessionListState) {
-        let popup = popup_rect(frame.area(), 68, 62);
-        let inner = popup_block(frame, popup, "Sessions", &self.theme);
+    fn render_tasks(&self, frame: &mut Frame, state: &TaskListState) {
+        let popup = popup_rect(frame.area(), 72, 64);
+        let inner = popup_block(frame, popup, "Tasks", &self.theme);
         let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
         let height = sections[0].height as usize;
         let offset = state.selected.saturating_sub(height.saturating_sub(1));
         let mut lines = Vec::new();
-        if self.session_meta.is_empty() {
-            lines.push(Line::from(Span::styled("No sessions", self.theme.dim())));
-        }
-        for (index, meta) in self
-            .session_meta
-            .iter()
-            .enumerate()
-            .skip(offset)
-            .take(height)
-        {
-            let current = meta.id == self.current_session;
+        for (index, task) in state.tasks.iter().enumerate().skip(offset).take(height) {
             let selected = index == state.selected;
             let style = if selected {
                 Style::default()
                     .bg(self.theme.palette.selection_bg)
                     .fg(self.theme.palette.fg)
-            } else if current {
-                Style::default()
-                    .fg(self.theme.palette.accent)
-                    .add_modifier(Modifier::BOLD)
             } else {
                 self.theme.text()
             };
-            let marker = if current { "*" } else { " " };
-            let age = meta.updated.elapsed().as_secs();
-            let when = if age < 60 {
-                format!("{age}s")
-            } else if age < 3_600 {
-                format!("{}m", age / 60)
+            let icon = match task.status.as_str() {
+                "done" => "✓",
+                "failed" => "✗",
+                "running" => "▸",
+                "skipped" => "-",
+                _ => "·",
+            };
+            let deps = if task.depends_on.is_empty() {
+                String::new()
             } else {
-                format!("{}h", age / 3_600)
+                format!("  ({} deps)", task.depends_on.len())
             };
             lines.push(Line::from(Span::styled(
                 format!(
-                    " {marker} {}  ({} turns, {when} ago)",
-                    truncate_chars(&meta.title, 36),
-                    meta.turns
+                    " {icon} {:>2}. {}{deps}",
+                    task.index + 1,
+                    truncate_chars(&task.title, sections[0].width.saturating_sub(12) as usize)
                 ),
                 style,
             )));
         }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled("No tasks", self.theme.dim())));
+        }
         frame.render_widget(Paragraph::new(Text::from(lines)), sections[0]);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "Enter switch · n new · d delete · Esc close",
+                "Enter jump to task · j/k select · Esc close",
                 self.theme.dim(),
             ))),
             sections[1],
@@ -2743,12 +3511,17 @@ fn help_line<'a>(section: &'a str, text: &'a str, theme: &Theme) -> Line<'a> {
     ])
 }
 
-fn filtered_models(picker: &ModelPicker) -> Vec<String> {
+fn filtered_models(picker: &ModelPicker) -> Vec<ModelChoice> {
     let query = picker.input.value().to_ascii_lowercase();
     picker
-        .models
+        .entries
         .iter()
-        .filter(|model| query.is_empty() || model.to_ascii_lowercase().contains(&query))
+        .filter(|choice| {
+            query.is_empty()
+                || format!("{}/{}", choice.provider, choice.model)
+                    .to_ascii_lowercase()
+                    .contains(&query)
+        })
         .cloned()
         .collect()
 }
@@ -2765,6 +3538,19 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i32> {
         position += index + ch.len_utf8();
     }
     Some(score)
+}
+
+fn marquee_text(text: &str, tick: usize, width: usize) -> String {
+    let length = text.chars().count();
+    if length <= width || width == 0 {
+        return truncate_chars(text, width);
+    }
+    let loop_text = format!("{text}   ·   ");
+    let chars: Vec<char> = loop_text.chars().collect();
+    let offset = tick % chars.len();
+    (0..width)
+        .map(|index| chars[(offset + index) % chars.len()])
+        .collect()
 }
 
 fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
@@ -2801,6 +3587,8 @@ mod tests {
             ctx,
             "ollama".to_string(),
             "qwen3.5:9b".to_string(),
+            None,
+            Bootstrap::default(),
             command_tx,
             ui_rx,
         );
@@ -2830,6 +3618,78 @@ mod tests {
         app.on_bus_event(Event::Plan(plan));
         terminal.draw(|frame| app.draw(frame)).unwrap();
         assert!(app.plan.review || !app.plan.running);
+    }
+
+    #[test]
+    fn tasks_overlay_lists_persisted_plan_tasks() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::open_at(&dir.path().join("state.db")).unwrap();
+        let now = now_epoch();
+        store
+            .insert_session(&SessionRecord {
+                id: "default".to_string(),
+                title: "Task session".to_string(),
+                provider: "ollama".to_string(),
+                model: "qwen3.5:9b".to_string(),
+                cwd: dir.path().display().to_string(),
+                status: SESSION_ACTIVE.to_string(),
+                turns: 0,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let plan = Plan {
+            title: "Task plan".to_string(),
+            goal: "Do tasks".to_string(),
+            steps: vec![
+                PlanStep {
+                    description: "First task".to_string(),
+                    files: Vec::new(),
+                    risk: Risk::Low,
+                    status: StepStatus::Pending,
+                },
+                PlanStep {
+                    description: "Second task".to_string(),
+                    files: Vec::new(),
+                    risk: Risk::Medium,
+                    status: StepStatus::Pending,
+                },
+            ],
+            notes: None,
+        };
+        store.save_plan("default", &plan).unwrap();
+
+        let config = Config::default();
+        let ctx = ToolContext::from_config(dir.path(), &config.tools).unwrap();
+        let bootstrap = Bootstrap {
+            session_id: "default".to_string(),
+            sessions: store
+                .list_sessions_for_cwd(&dir.path().display().to_string())
+                .unwrap(),
+            messages: Vec::new(),
+            chat: ChatState::new(),
+            tools: Vec::new(),
+            plan: Some(plan),
+            recovered: None,
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (_ui_tx, ui_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            config,
+            dir.path().join("config.toml"),
+            ctx,
+            "ollama".to_string(),
+            "qwen3.5:9b".to_string(),
+            Some(store),
+            bootstrap,
+            tx,
+            ui_rx,
+        );
+        app.open_tasks();
+        match &app.overlay {
+            Some(Overlay::Tasks(state)) => assert_eq!(state.tasks.len(), 2),
+            _ => panic!("expected tasks overlay"),
+        }
     }
 
     #[test]
@@ -2865,20 +3725,47 @@ mod tests {
     }
 
     #[test]
+    fn writes_handoff_on_shutdown() {
+        let dir = tempdir().unwrap();
+        let (mut app, _rx) = test_app(dir.path());
+        app.record_prompt("build the feature");
+        app.chat.push_user("build the feature");
+        app.chat
+            .items
+            .push(ChatItem::Assistant("implemented it".to_string()));
+        app.shutdown();
+
+        let handoff = std::fs::read_to_string(dir.path().join("HANDOFF.md")).unwrap();
+        assert!(handoff.contains("# palicode handoff"));
+        assert!(handoff.contains("build the feature"));
+        assert!(handoff.contains("implemented it"));
+        assert!(handoff.contains(&format!("palicode resume {}", app.current_session)));
+    }
+
+    #[test]
     fn mouse_click_focuses_panes() {
         let dir = tempdir().unwrap();
         let (mut app, _rx) = test_app(dir.path());
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
 
-        let plan = app.layout.plan;
+        let sessions = app.layout.sessions;
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: plan.x + 2,
-            row: plan.y + 2,
+            column: sessions.x + 2,
+            row: sessions.y + 2,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(app.focus, Focus::Plan);
+        assert_eq!(app.focus, Focus::Sessions);
+
+        let agents = app.layout.agents;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: agents.x + 2,
+            row: agents.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Agents);
 
         let input = app.layout.input;
         app.handle_mouse(MouseEvent {
@@ -2920,6 +3807,71 @@ mod tests {
             Ok(AgentCommand::GeneratePlan(task)) => assert_eq!(task, "create x"),
             _ => panic!("expected GeneratePlan command"),
         }
+    }
+
+    #[test]
+    fn marquee_scrolls_long_titles() {
+        let text = "a very long session title that does not fit";
+        let first = marquee_text(text, 0, 10);
+        let second = marquee_text(text, 1, 10);
+        assert_eq!(first.chars().count(), 10);
+        assert_eq!(second.chars().count(), 10);
+        assert_ne!(first, second);
+        assert_eq!(marquee_text("short", 5, 20), "short");
+    }
+
+    #[test]
+    fn plus_button_creates_a_session() {
+        let dir = tempdir().unwrap();
+        let (mut app, mut rx) = test_app(dir.path());
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let button = app.layout.new_session;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: button.x,
+            row: button.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.session_meta.len(), 2);
+        assert!(matches!(rx.try_recv(), Ok(AgentCommand::NewSession(_))));
+    }
+
+    #[test]
+    fn hovering_a_session_starts_marquee() {
+        let dir = tempdir().unwrap();
+        let (mut app, _rx) = test_app(dir.path());
+        app.session_meta[0].title = "a very long future session title for marquee".to_string();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let sessions = app.layout.sessions;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: sessions.x + 1,
+            row: sessions.y + 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.hovered_session, Some(0));
+    }
+
+    #[test]
+    fn diff_moves_to_the_main_panel() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\nTWO\n").unwrap();
+        let (mut app, _rx) = test_app(dir.path());
+        app.on_agent_event(AgentEvent::Diff {
+            tool: "edit_file".to_string(),
+            diff: "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n".to_string(),
+        });
+        assert_eq!(app.main_view, MainView::Diff);
+        assert_eq!(app.focus, Focus::Diff);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        app.focus_pane(Focus::Chat, false);
+        assert_eq!(app.main_view, MainView::Chat);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
     }
 
     #[test]

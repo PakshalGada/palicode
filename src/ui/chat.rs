@@ -1,10 +1,13 @@
 //! Chat transcript state and rendering helpers.
 
+use crate::provider::Message;
+use crate::provider::types::Role;
 use crate::ui::theme::Theme;
 use crate::ui::util::wrapped;
 use crate::util::text::one_line;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct ToolLogEntry {
@@ -26,6 +29,14 @@ pub enum ChatItem {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct ReplyStats {
+    pub duration_ms: u128,
+    pub completion_tokens: u64,
+    pub estimated: bool,
+    pub model: String,
+}
+
 #[derive(Debug, Default)]
 pub struct ChatState {
     pub items: Vec<ChatItem>,
@@ -34,6 +45,7 @@ pub struct ChatState {
     pub auto_scroll: bool,
     pub line_count: usize,
     pub viewport_height: u16,
+    assistant_stats: HashMap<usize, ReplyStats>,
 }
 
 impl ChatState {
@@ -50,6 +62,26 @@ impl ChatState {
         self.scroll = 0;
         self.auto_scroll = true;
         self.line_count = 0;
+        self.assistant_stats.clear();
+    }
+
+    pub fn set_assistant_stats(&mut self, index: usize, stats: ReplyStats) {
+        self.assistant_stats.insert(index, stats);
+    }
+
+    pub fn last_assistant_index(&self) -> Option<usize> {
+        self.items
+            .iter()
+            .rposition(|item| matches!(item, ChatItem::Assistant(_)))
+    }
+
+    pub fn has_conversation(&self) -> bool {
+        self.items.iter().any(|item| {
+            matches!(
+                item,
+                ChatItem::User(_) | ChatItem::Assistant(_) | ChatItem::Tool(_)
+            )
+        })
     }
 
     pub fn push_user(&mut self, text: impl Into<String>) {
@@ -100,6 +132,89 @@ impl ChatState {
         self.streaming = None;
     }
 
+    /// Rebuild a transcript and tool log from persisted provider messages.
+    pub fn restore(messages: &[Message]) -> (Self, Vec<ToolLogEntry>) {
+        let mut chat = Self::new();
+        let mut tools: Vec<ToolLogEntry> = Vec::new();
+        let mut call_index: HashMap<String, usize> = HashMap::new();
+        let mut pending: HashMap<String, usize> = HashMap::new();
+
+        for message in messages {
+            match message.role {
+                Role::System => {
+                    if let Some(content) = &message.content
+                        && content.starts_with("[context summary")
+                    {
+                        chat.push_info(content);
+                    }
+                }
+                Role::User => {
+                    if let Some(content) = &message.content {
+                        chat.push_user(content);
+                    }
+                }
+                Role::Assistant => {
+                    if let Some(content) = &message.content
+                        && !content.trim().is_empty()
+                    {
+                        chat.items.push(ChatItem::Assistant(content.clone()));
+                    }
+                    for call in &message.tool_calls {
+                        let index = tools.len();
+                        tools.push(ToolLogEntry {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            output: String::new(),
+                            is_error: false,
+                            duration_ms: None,
+                            expanded: false,
+                        });
+                        chat.push_tool(index);
+                        call_index.insert(call.id.clone(), index);
+                        pending.insert(call.id.clone(), index);
+                    }
+                }
+                Role::Tool => {
+                    let Some(content) = &message.content else {
+                        continue;
+                    };
+                    let Some(call_id) = &message.tool_call_id else {
+                        continue;
+                    };
+                    if let Some(index) = call_index.get(call_id).copied() {
+                        tools[index].output = content.clone();
+                        tools[index].is_error = content.starts_with("ERROR:");
+                        pending.remove(call_id);
+                    } else {
+                        let index = tools.len();
+                        tools.push(ToolLogEntry {
+                            id: call_id.clone(),
+                            name: "tool".to_string(),
+                            arguments: String::new(),
+                            output: content.clone(),
+                            is_error: content.starts_with("ERROR:"),
+                            duration_ms: None,
+                            expanded: false,
+                        });
+                        chat.push_tool(index);
+                    }
+                }
+            }
+        }
+
+        for index in pending.values() {
+            if tools[*index].output.is_empty() {
+                tools[*index].output =
+                    "ERROR: interrupted tool call; state may be partial.".to_string();
+                tools[*index].is_error = true;
+            }
+        }
+        chat.streaming = None;
+        chat.auto_scroll = true;
+        (chat, tools)
+    }
+
     pub fn scroll_by(&mut self, delta: isize) {
         self.auto_scroll = false;
         let max = self
@@ -148,6 +263,18 @@ impl ChatState {
                             .push(Span::styled("▌", Style::default().fg(palette.accent)));
                     }
                     lines.extend(item_lines);
+                    if self.streaming != Some(index)
+                        && let Some(stats) = self.assistant_stats.get(&index)
+                    {
+                        let seconds = stats.duration_ms as f64 / 1000.0;
+                        let tokens_per_second = stats.completion_tokens as f64 / seconds.max(0.001);
+                        let estimate = if stats.estimated { "~" } else { "" };
+                        let footer = format!(
+                            "  {seconds:.2}s · {estimate}{tokens_per_second:.1} tok/s · {}",
+                            stats.model
+                        );
+                        lines.extend(wrapped(&footer, width, "", "", theme.dim()));
+                    }
                 }
                 ChatItem::Tool(tool_index) => {
                     let Some(tool) = tools.get(*tool_index) else {
@@ -256,6 +383,33 @@ mod tests {
             ChatItem::Assistant(text) => assert_eq!(text, "hello world"),
             _ => panic!("expected assistant"),
         }
+    }
+
+    #[test]
+    fn assistant_footer_has_timing_and_model() {
+        let mut chat = ChatState::new();
+        chat.push_user("question");
+        let index = chat.ensure_streaming();
+        chat.append_delta("answer");
+        chat.end_streaming();
+        chat.set_assistant_stats(
+            index,
+            ReplyStats {
+                duration_ms: 2_000,
+                completion_tokens: 100,
+                estimated: false,
+                model: "ollama/qwen3.5:9b".to_string(),
+            },
+        );
+        let lines = chat.build_lines(60, &[], &Theme::dark());
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("2.00s"));
+        assert!(text.contains("50.0 tok/s"));
+        assert!(text.contains("ollama/qwen3.5:9b"));
     }
 
     #[test]

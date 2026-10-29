@@ -53,8 +53,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Launch the TUI (implemented in Phase 3)
+    /// Launch the TUI
     Tui,
+    /// Resume a durable session in the TUI (latest interrupted by default)
+    Resume {
+        /// Session ID from `palicode sessions`
+        id: Option<String>,
+    },
+    /// List durable sessions
+    Sessions,
     /// Interactive REPL with tools
     Repl,
     /// Run one prompt headlessly and exit
@@ -122,8 +129,12 @@ pub async fn run() -> Result<()> {
 
     match command {
         Command::Tui => {
-            crate::ui::run(config, config_path, ctx, cli.provider, cli.model).await?;
+            crate::ui::run(config, config_path, ctx, cli.provider, cli.model, None).await?;
         }
+        Command::Resume { id } => {
+            crate::ui::run(config, config_path, ctx, cli.provider, cli.model, id).await?;
+        }
+        Command::Sessions => list_sessions(&cwd),
         Command::Repl => {
             session::repl(config, ctx, cli.provider, cli.model).await?;
         }
@@ -153,6 +164,7 @@ fn parse_approval_mode(value: &str) -> std::result::Result<ApprovalMode, String>
 }
 
 fn resolve_cwd(given: Option<&Path>) -> Result<PathBuf> {
+    let explicit = given.is_some();
     let path = match given {
         Some(path) => path.to_path_buf(),
         None => std::env::current_dir().context("cannot determine current directory")?,
@@ -163,7 +175,19 @@ fn resolve_cwd(given: Option<&Path>) -> Result<PathBuf> {
     if !path.is_dir() {
         bail!("{} is not a directory", path.display());
     }
+    // When launched implicitly, scope sessions to the repository root so the
+    // same project shares one workspace even from a subdirectory.
+    if !explicit && let Some(root) = find_git_root(&path) {
+        return Ok(root);
+    }
     Ok(path)
+}
+
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|candidate| candidate.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 fn init_logging(config: &Config, verbose: u8) {
@@ -210,7 +234,15 @@ async fn list_models(config: &Config) {
     for probe in probes {
         let disabled = if probe.enabled { "" } else { " [disabled]" };
         match probe.model_count() {
-            Some(count) => println!("{} ({count} models){disabled}", probe.name),
+            Some(count) => println!(
+                "{} ({count} models){disabled}{}",
+                probe.name,
+                if probe.has_credentials {
+                    ""
+                } else {
+                    " [no API key; browsing only]"
+                }
+            ),
             None => println!("{}{disabled}", probe.name),
         }
         println!("  {}", probe.base_url);
@@ -224,6 +256,34 @@ async fn list_models(config: &Config) {
             Err(reason) => println!("  ! {reason}"),
         }
         println!();
+    }
+}
+
+fn list_sessions(cwd: &Path) {
+    let store = match crate::state::StateStore::open() {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("error: cannot open state database: {err:#}");
+            return;
+        }
+    };
+    let cwd = cwd.display().to_string();
+    println!("Project: {cwd}");
+    match store.list_sessions_for_cwd(&cwd) {
+        Ok(sessions) if sessions.is_empty() => {
+            println!("No durable sessions for this project yet.")
+        }
+        Ok(sessions) => {
+            let now = crate::state::now_epoch();
+            for session in sessions {
+                let age = now.saturating_sub(session.updated_at).max(0);
+                println!(
+                    "{}  {:<11}  {:>6}s ago  {:>3} turns  {}",
+                    session.id, session.status, age, session.turns, session.title
+                );
+            }
+        }
+        Err(err) => eprintln!("error: cannot list sessions: {err:#}"),
     }
 }
 

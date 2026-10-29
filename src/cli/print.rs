@@ -62,6 +62,21 @@ impl Printer {
                     let _ = std::io::stdout().flush();
                 }
             }
+            AgentEvent::ResponseStats {
+                duration_ms,
+                completion_tokens,
+                estimated,
+                model,
+            } => {
+                self.close_text();
+                self.close_reasoning();
+                let seconds = duration_ms as f64 / 1000.0;
+                let tokens_per_second = completion_tokens as f64 / seconds.max(0.001);
+                let estimate = if estimated { "~" } else { "" };
+                let line =
+                    format!("  {seconds:.2}s · {estimate}{tokens_per_second:.1} tok/s · {model}");
+                self.meta(&self.paint(DIM, &line));
+            }
             AgentEvent::AssistantMessage => {
                 self.close_text();
                 self.close_reasoning();

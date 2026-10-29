@@ -28,6 +28,7 @@ pub struct ProviderProbe {
     pub name: String,
     pub base_url: String,
     pub enabled: bool,
+    pub has_credentials: bool,
     /// `Ok(models)` when reachable, `Err(reason)` otherwise.
     pub result: std::result::Result<Vec<String>, String>,
 }
@@ -73,6 +74,7 @@ pub async fn probe_all(config: &Config) -> Vec<ProviderProbe> {
                     name: cfg.name.clone(),
                     base_url: cfg.base_url.clone(),
                     enabled: cfg.enabled,
+                    has_credentials: cfg.has_credentials(),
                     result: Err(format!("{err:#}")),
                 })
                 .collect();
@@ -81,15 +83,23 @@ pub async fn probe_all(config: &Config) -> Vec<ProviderProbe> {
 
     let mut probes = Vec::new();
     for cfg in &config.providers.list {
+        let has_credentials = cfg.has_credentials();
         let result = if !cfg.enabled {
             Err("disabled in config".to_string())
-        } else if !cfg.has_credentials() {
-            Err(format!("missing API key (set ${})", cfg.api_key_env))
         } else {
+            // Some gateways (OpenCode Console) expose their model catalog
+            // publicly, so list even when no key is configured.
             match build(cfg, &client) {
                 Ok(provider) => match timeout(PROBE_TIMEOUT, provider.list_models()).await {
                     Ok(Ok(models)) => Ok(models),
+                    Ok(Err(err)) if !has_credentials => Err(format!(
+                        "missing API key (set ${}): {err:#}",
+                        cfg.api_key_env
+                    )),
                     Ok(Err(err)) => Err(format!("{err:#}")),
+                    Err(_) if !has_credentials => {
+                        Err(format!("missing API key (set ${})", cfg.api_key_env))
+                    }
                     Err(_) => Err(format!("timed out after {}s", PROBE_TIMEOUT.as_secs())),
                 },
                 Err(err) => Err(format!("{err:#}")),
@@ -99,6 +109,7 @@ pub async fn probe_all(config: &Config) -> Vec<ProviderProbe> {
             name: cfg.name.clone(),
             base_url: cfg.base_url.clone(),
             enabled: cfg.enabled,
+            has_credentials,
             result,
         });
     }
