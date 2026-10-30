@@ -15,14 +15,33 @@ pub const CONFIG_FILE: &str = "config.toml";
 pub const EXAMPLE_CONFIG: &str = include_str!("../../assets/config.example.toml");
 
 /// Top-level configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub general: GeneralConfig,
     pub providers: ProvidersConfig,
     pub tools: ToolsConfig,
     pub permissions: PermissionsConfig,
+    pub memory: MemoryConfig,
     pub tui: TuiConfig,
+    /// False when `.palicode/` exists but the workspace has not been trusted.
+    /// Project config, rules, and imports are ignored while this is false.
+    #[serde(skip)]
+    pub project_trusted: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            general: GeneralConfig::default(),
+            providers: ProvidersConfig::default(),
+            tools: ToolsConfig::default(),
+            permissions: PermissionsConfig::default(),
+            memory: MemoryConfig::default(),
+            tui: TuiConfig::default(),
+            project_trusted: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +76,14 @@ pub enum ApprovalMode {
     Suggest,
     AutoEdit,
     FullAuto,
+    /// Read-only analysis: every mutation, including shell commands that write,
+    /// is denied.
+    Plan,
+    /// Allow read-only work and explicit allow rules; anything that would need
+    /// a prompt is denied instead of blocking.
+    DontAsk,
+    /// Allow everything except built-in safety denials and protected paths.
+    BypassPermissions,
 }
 
 impl fmt::Display for ApprovalMode {
@@ -71,16 +98,32 @@ impl ApprovalMode {
             ApprovalMode::Suggest => "suggest",
             ApprovalMode::AutoEdit => "auto-edit",
             ApprovalMode::FullAuto => "full-auto",
+            ApprovalMode::Plan => "plan",
+            ApprovalMode::DontAsk => "dont-ask",
+            ApprovalMode::BypassPermissions => "bypass-permissions",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "suggest" | "default" => Some(ApprovalMode::Suggest),
-            "auto-edit" | "auto_edit" | "autoedit" | "edit" => Some(ApprovalMode::AutoEdit),
-            "full-auto" | "full_auto" | "fullauto" | "yolo" => Some(ApprovalMode::FullAuto),
+        match value.trim().to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
+            "suggest" | "default" | "ask" => Some(ApprovalMode::Suggest),
+            "auto-edit" | "autoedit" | "edit" | "accept-edits" => Some(ApprovalMode::AutoEdit),
+            "full-auto" | "fullauto" | "yolo" => Some(ApprovalMode::FullAuto),
+            "plan" | "read-only" | "readonly" => Some(ApprovalMode::Plan),
+            "dont-ask" | "dontask" | "deny" => Some(ApprovalMode::DontAsk),
+            "bypass-permissions" | "bypasspermissions" | "bypass" | "unsafe" => {
+                Some(ApprovalMode::BypassPermissions)
+            }
             _ => None,
         }
+    }
+
+    /// True when mutations are allowed without asking.
+    pub fn is_permissive(self) -> bool {
+        matches!(
+            self,
+            ApprovalMode::FullAuto | ApprovalMode::BypassPermissions
+        )
     }
 }
 
@@ -89,7 +132,9 @@ impl std::str::FromStr for ApprovalMode {
 
     fn from_str(value: &str) -> Result<Self> {
         Self::parse(value).with_context(|| {
-            format!("invalid approval mode '{value}' (expected suggest, auto-edit, or full-auto)")
+            format!(
+                "invalid approval mode '{value}' (expected suggest, auto-edit, full-auto, plan, dont-ask, or bypass-permissions)"
+            )
         })
     }
 }
@@ -145,6 +190,11 @@ pub struct ToolsConfig {
 #[serde(default)]
 pub struct PermissionsConfig {
     pub rules: Vec<PermissionRule>,
+    /// Claude-style shorthand lists. Each entry is a `Tool(specifier)` or a
+    /// bare tool name.
+    pub allow: Vec<String>,
+    pub ask: Vec<String>,
+    pub deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +213,42 @@ pub enum PermissionAction {
     Allow,
     Ask,
     Deny,
+}
+
+/// Project-memory discovery (`PALICODE.md`, imports, `.palicode/rules`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Load instruction files at all. Useful for scripted runs in sensitive
+    /// repositories.
+    pub enabled: bool,
+    /// Maximum number of `@import` hops (the root file is depth 0).
+    pub max_import_depth: usize,
+    /// Globs excluded from `@import` expansion, relative to the importing file
+    /// or workspace.
+    pub exclude: Vec<String>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_import_depth: 4,
+            exclude: vec![
+                ".git/**".to_string(),
+                "node_modules/**".to_string(),
+                "target/**".to_string(),
+                ".venv/**".to_string(),
+                "dist/**".to_string(),
+                "build/**".to_string(),
+                "*.lock".to_string(),
+                "*.png".to_string(),
+                "*.jpg".to_string(),
+                "*.pdf".to_string(),
+                "*.zip".to_string(),
+            ],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,9 +407,7 @@ impl Config {
 
     pub fn load_from_optional(path: &Path, required: bool) -> Result<Self> {
         let mut config = if path.is_file() {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read config {}", path.display()))?;
-            toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?
+            Self::read_file(path)?
         } else if required {
             bail!("config file {} does not exist", path.display());
         } else {
@@ -333,6 +417,116 @@ impl Config {
         config.apply_env();
         config.validate()?;
         Ok(config)
+    }
+
+    fn read_file(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read config {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))
+    }
+
+    fn read_value(path: &Path) -> Result<toml::Value> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read config {}", path.display()))?;
+        text.parse::<toml::Value>()
+            .with_context(|| format!("invalid config {}", path.display()))
+    }
+
+    /// Load the user config, layer the trusted project config on top, then
+    /// apply environment variables. CLI flags are applied by the caller and
+    /// therefore win over everything here.
+    pub fn load_hierarchy(cwd: &Path) -> Result<Self> {
+        Self::load_hierarchy_from(&Self::path()?, cwd)
+    }
+
+    pub fn load_hierarchy_from(user_path: &Path, cwd: &Path) -> Result<Self> {
+        let mut value = if user_path.is_file() {
+            Self::read_value(user_path)?
+        } else {
+            toml::Value::Table(Default::default())
+        };
+
+        let project_path = cwd.join(".palicode").join(CONFIG_FILE);
+        let has_project = project_path.is_file() || cwd.join(".palicode").join("rules").is_dir();
+        let trusted = crate::trust::is_trusted(cwd);
+        if project_path.is_file() {
+            if trusted {
+                let project = Self::read_value(&project_path)?;
+                merge_values(&mut value, project, "");
+            } else {
+                tracing::warn!(
+                    path = %project_path.display(),
+                    "project config ignored: workspace is not trusted (run `palicode trust`)"
+                );
+            }
+        }
+
+        // Optional Claude-style settings compatibility. These are only read
+        // after trust, exactly like project config/rules.
+        if trusted {
+            for settings in [
+                cwd.join(".claude").join("settings.json"),
+                cwd.join(".claude").join("settings.local.json"),
+            ] {
+                merge_claude_settings(&mut value, &settings);
+            }
+        }
+
+        let mut config: Config =
+            value.try_into().context("invalid merged configuration")?;
+        config.project_trusted = trusted || !has_project;
+        config.apply_env();
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Insert a rule into the project config, creating `.palicode/config.toml`
+    /// and `.palicode/` as needed. Used by "don't ask again" approvals.
+    pub fn add_project_rule(cwd: &Path, rule: &PermissionRule) -> Result<PathBuf> {
+        let dir = cwd.join(".palicode");
+        let path = dir.join(CONFIG_FILE);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("cannot create {}", dir.display()))?;
+
+        let mut root = if path.is_file() {
+            Self::read_value(&path)?
+        } else {
+            toml::Value::Table(Default::default())
+        };
+        let table = root
+            .as_table_mut()
+            .context("project config root must be a table")?;
+        let permissions = table
+            .entry("permissions")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .context("permissions must be a table")?;
+        let rules = permissions
+            .entry("rules")
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+            .context("permissions.rules must be an array")?;
+        let mut entry = toml::value::Table::new();
+        entry.insert("tool".to_string(), toml::Value::String(rule.tool.clone()));
+        if let Some(pattern) = &rule.pattern {
+            entry.insert("pattern".to_string(), toml::Value::String(pattern.clone()));
+        }
+        entry.insert(
+            "action".to_string(),
+            toml::Value::String(match rule.action {
+                PermissionAction::Allow => "allow".to_string(),
+                PermissionAction::Ask => "ask".to_string(),
+                PermissionAction::Deny => "deny".to_string(),
+            }),
+        );
+        let value = toml::Value::Table(entry);
+        if !rules.iter().any(|existing| existing == &value) {
+            rules.push(value);
+        }
+        let text = toml::to_string_pretty(&root).context("cannot serialize project config")?;
+        std::fs::write(&path, text)
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        Ok(path)
     }
 
     /// Environment variables override file values.
@@ -385,6 +579,9 @@ impl Config {
         }
         if self.general.verify_retries > 10 {
             bail!("general.verify_retries must be at most 10");
+        }
+        if self.memory.max_import_depth > 16 {
+            bail!("memory.max_import_depth must be at most 16");
         }
         if self.tools.shell_timeout_secs == 0 {
             bail!("tools.shell_timeout_secs must be greater than zero");
@@ -496,6 +693,86 @@ fn parse_bool(value: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+fn merge_values(base: &mut toml::Value, overlay: toml::Value, prefix: &str) {
+    match (base, overlay) {
+        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
+            for (key, value) in overlay_table {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                match base_table.get_mut(&key) {
+                    Some(existing) => {
+                        let concatenate = matches!(
+                            path.as_str(),
+                            "permissions.rules"
+                                | "permissions.allow"
+                                | "permissions.ask"
+                                | "permissions.deny"
+                        );
+                        if concatenate {
+                            if let (toml::Value::Array(base_items), toml::Value::Array(items)) =
+                                (&mut *existing, value)
+                            {
+                                base_items.extend(items);
+                            }
+                        } else {
+                            merge_values(existing, value, &path);
+                        }
+                    }
+                    None => {
+                        base_table.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+/// Read the `permissions.allow/ask/deny` arrays from a Claude settings file.
+fn merge_claude_settings(target: &mut toml::Value, path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        tracing::warn!(path = %path.display(), "ignoring invalid Claude settings file");
+        return;
+    };
+    let Some(permissions) = json.get("permissions") else {
+        return;
+    };
+    let Some(table) = target.as_table_mut() else {
+        return;
+    };
+    let permissions_table = table
+        .entry("permissions")
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    let Some(permissions_table) = permissions_table.as_table_mut() else {
+        return;
+    };
+    for key in ["allow", "ask", "deny"] {
+        let Some(values) = permissions.get(key).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let entry = permissions_table
+            .entry(key)
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        let Some(items) = entry.as_array_mut() else {
+            continue;
+        };
+        for value in values {
+            if let Some(text) = value.as_str() {
+                let text = toml::Value::String(text.to_string());
+                if !items.contains(&text) {
+                    items.push(text);
+                }
+            }
+        }
     }
 }
 

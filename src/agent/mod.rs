@@ -14,17 +14,19 @@ use crate::approval::{
 };
 use crate::config::{ApprovalMode, Config};
 use crate::event::{Event, EventBus};
+use crate::memory::{self, ProjectMemory};
 use crate::provider::types::Role;
 use crate::provider::{ChatRequest, ChatResponse, Message, Provider, ToolCall, Usage};
+use crate::token::{ContextUsage, estimate_json_tokens, estimate_tokens};
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 use crate::util::text::truncate_middle;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde_json::Value;
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use tracing::debug;
 
 use self::subagent::SessionSubagentRunner;
@@ -103,6 +105,8 @@ pub struct AgentSession {
     ctx: ToolContext,
     messages: Vec<Message>,
     max_steps: usize,
+    /// The user-configured prompt, before project memory is appended.
+    base_system_prompt: String,
     system_prompt: String,
     permissions: PermissionEngine,
     approver: Arc<dyn Approver>,
@@ -114,6 +118,27 @@ pub struct AgentSession {
     compact_keep_messages: usize,
     verify_command: Option<String>,
     verify_retries: usize,
+    memory: ProjectMemory,
+    loaded_rules: HashSet<PathBuf>,
+    pending_reminders: Vec<String>,
+    file_state: HashMap<PathBuf, FileStamp>,
+    memory_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+impl FileStamp {
+    fn capture(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    }
 }
 
 impl AgentSession {

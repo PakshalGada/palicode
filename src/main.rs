@@ -6,9 +6,12 @@ mod cli;
 mod config;
 mod credentials;
 mod event;
+mod memory;
 mod provider;
 mod state;
+mod token;
 mod tools;
+mod trust;
 mod ui;
 mod util;
 
