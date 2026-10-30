@@ -5,7 +5,8 @@ Minimal, shortcut-driven terminal coding agent in Rust. Provider-agnostic
 
 **Status:** Phases 0–5 are complete, plus project-scoped workspaces and a global
 CLI install: providers/tools, planner + approvals, TUI, durable SQLite state,
-crash-safe resume, compaction, handoff, verification, and parallel task DAGs.
+crash-safe resume, compaction, handoff, verification, parallel task DAGs, and
+rich Markdown answers with colored code blocks and tables.
 
 ## Quick start
 
@@ -145,10 +146,17 @@ tool log, plan, diff, and subagent state, restored from SQLite checkpoints.
 
 ### Themes
 
-The default is **black and white** (`mono-dark`): black background, white/gray
-text, grayscale syntax highlighting and diff shading. `Ctrl+K → Theme: toggle
-dark/light` switches to `mono-light` (white background, black/gray text). Both
-are strictly monochrome—no hue anywhere.
+The chrome is **black and white** (`mono-dark`): black background, white/gray
+panels, borders, status text, and grayscale diffs. `Ctrl+K → Theme: toggle
+dark/light` switches to `mono-light` (white background, black/gray chrome).
+Assistant answers render Markdown with a small semantic accent palette:
+colored headings and links, inline-code chips, block quotes, bordered tables,
+and fenced code blocks with real syntax colors. This keeps the interface calm
+while making model output faster to scan. Supported syntax includes headings,
+bold/italic/strikethrough, links, inline code, ordered/unordered and task lists,
+block quotes, horizontal rules, GFM tables (which shrink to fit the panel), and
+fenced code blocks. Rendering is width-aware, so long paragraphs, links, and
+code lines wrap without breaking the chat scroll position.
 
 ## Durable state & long-horizon
 
@@ -334,8 +342,8 @@ ordering.
 - `state/` - SQLite schema/migrations, WAL checkpoints, sessions, plans/tasks,
   handoffs
 - `credentials` - user-only (0600) provider key storage outside config.toml
-- `ui/` - ratatui app, chat/plan/diff/agent panes, syntect diff highlighting,
-  command palette, model switcher, themes, and the agent worker
+- `ui/` - ratatui app, chat/plan/diff/agent panes, Markdown + syntect answer
+  rendering, command palette, model switcher, themes, and the agent worker
 - `cli/` - REPL, headless run, plan review, config/discovery commands
 
 The TUI's agent worker owns the session; the UI communicates with it over
@@ -351,7 +359,7 @@ requests are oneshot round-trips, so the worker pauses until the modal answers.
 ## Verification
 
 ```bash
-cargo test          # 144 tests: providers, SSE, plans, permissions, diff revert, TUI, fs, search, shell, git, agent
+cargo test          # 154 tests: providers, SSE, plans, permissions, diff revert, TUI, Markdown, fs, search, shell, git, agent
 cargo clippy --all-targets -- -D warnings
 ```
 

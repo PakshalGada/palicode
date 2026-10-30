@@ -2,7 +2,8 @@
 
 use crate::provider::Message;
 use crate::provider::types::Role;
-use crate::ui::theme::Theme;
+use crate::ui::markdown::render_markdown;
+use crate::ui::theme::{SyntaxEngine, Theme, ThemeMode};
 use crate::ui::util::wrapped;
 use crate::util::text::one_line;
 use ratatui::style::{Modifier, Style};
@@ -37,6 +38,14 @@ pub struct ReplyStats {
     pub model: String,
 }
 
+#[derive(Debug, Clone)]
+struct MarkdownCache {
+    text: String,
+    width: u16,
+    mode: ThemeMode,
+    lines: Vec<Line<'static>>,
+}
+
 #[derive(Debug, Default)]
 pub struct ChatState {
     pub items: Vec<ChatItem>,
@@ -46,6 +55,7 @@ pub struct ChatState {
     pub line_count: usize,
     pub viewport_height: u16,
     assistant_stats: HashMap<usize, ReplyStats>,
+    markdown_cache: HashMap<usize, MarkdownCache>,
 }
 
 impl ChatState {
@@ -63,6 +73,7 @@ impl ChatState {
         self.auto_scroll = true;
         self.line_count = 0;
         self.assistant_stats.clear();
+        self.markdown_cache.clear();
     }
 
     pub fn set_assistant_stats(&mut self, index: usize, stats: ReplyStats) {
@@ -238,6 +249,7 @@ impl ChatState {
         width: u16,
         tools: &[ToolLogEntry],
         theme: &Theme,
+        syntax: &SyntaxEngine,
     ) -> Vec<Line<'static>> {
         let palette = theme.palette;
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -255,7 +267,27 @@ impl ChatState {
                     lines.extend(wrapped(text, width, "❯ ", "  ", style));
                 }
                 ChatItem::Assistant(text) => {
-                    let mut item_lines = wrapped(text, width, "", "", theme.text());
+                    let cached = self.markdown_cache.get(&index).filter(|cached| {
+                        cached.text == *text && cached.width == width && cached.mode == theme.mode
+                    });
+                    let mut item_lines = if let Some(cached) = cached {
+                        cached.lines.clone()
+                    } else {
+                        let lines = render_markdown(text, width, theme, syntax);
+                        self.markdown_cache.insert(
+                            index,
+                            MarkdownCache {
+                                text: text.clone(),
+                                width,
+                                mode: theme.mode,
+                                lines: lines.clone(),
+                            },
+                        );
+                        lines
+                    };
+                    if item_lines.is_empty() {
+                        item_lines.push(Line::from(""));
+                    }
                     if self.streaming == Some(index)
                         && let Some(last) = item_lines.last_mut()
                     {
@@ -401,7 +433,7 @@ mod tests {
                 model: "ollama/qwen3.5:9b".to_string(),
             },
         );
-        let lines = chat.build_lines(60, &[], &Theme::dark());
+        let lines = chat.build_lines(60, &[], &Theme::dark(), &SyntaxEngine::new());
         let text: String = lines
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -425,7 +457,7 @@ mod tests {
             expanded: false,
         }];
         chat.push_tool(0);
-        let lines = chat.build_lines(40, &tools, &Theme::dark());
+        let lines = chat.build_lines(40, &tools, &Theme::dark(), &SyntaxEngine::new());
         let text: String = lines
             .iter()
             .flat_map(|line| line.spans.iter())

@@ -4,6 +4,7 @@ pub mod agents;
 pub mod app;
 pub mod chat;
 pub mod diff;
+pub mod markdown;
 pub mod plan;
 pub mod theme;
 pub mod util;

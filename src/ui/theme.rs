@@ -1,6 +1,10 @@
-//! Monochrome theme + syntect-backed grayscale syntax highlighting.
+//! Monochrome chrome + syntect-backed syntax highlighting.
+//!
+//! UI chrome stays black/white, while Markdown answers use a small set of
+//! semantic accents (headings, links, inline code, tables) and real syntax
+//! colors inside fenced code blocks.
 
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -33,6 +37,16 @@ pub struct Palette {
     pub added_bg: Color,
     pub removed_bg: Color,
     pub status_bg: Color,
+    // Semantic colors used only by rendered Markdown answers.
+    pub heading: Color,
+    pub link: Color,
+    pub inline_code: Color,
+    pub inline_code_bg: Color,
+    pub quote: Color,
+    pub code_border: Color,
+    pub code_bg: Color,
+    pub table_border: Color,
+    pub table_header: Color,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,7 +64,7 @@ impl Theme {
         }
     }
 
-    /// Black background, white/gray text. No hue anywhere.
+    /// Black background, white/gray chrome, muted Markdown accents.
     pub fn dark() -> Self {
         Self {
             mode: ThemeMode::Dark,
@@ -72,11 +86,20 @@ impl Theme {
                 added_bg: Color::Rgb(32, 32, 32),
                 removed_bg: Color::Rgb(52, 52, 52),
                 status_bg: Color::Rgb(16, 16, 16),
+                heading: Color::Rgb(122, 162, 247),
+                link: Color::Rgb(97, 175, 239),
+                inline_code: Color::Rgb(229, 192, 123),
+                inline_code_bg: Color::Rgb(32, 32, 32),
+                quote: Color::Rgb(160, 160, 160),
+                code_border: Color::Rgb(75, 75, 75),
+                code_bg: Color::Rgb(18, 18, 18),
+                table_border: Color::Rgb(90, 90, 90),
+                table_header: Color::Rgb(255, 255, 255),
             },
         }
     }
 
-    /// White background, black/gray text. Also strictly monochrome.
+    /// White background, black/gray chrome, darker Markdown accents.
     pub fn light() -> Self {
         Self {
             mode: ThemeMode::Light,
@@ -98,6 +121,15 @@ impl Theme {
                 added_bg: Color::Rgb(232, 232, 232),
                 removed_bg: Color::Rgb(210, 210, 210),
                 status_bg: Color::Rgb(240, 240, 240),
+                heading: Color::Rgb(30, 80, 180),
+                link: Color::Rgb(0, 90, 180),
+                inline_code: Color::Rgb(140, 80, 0),
+                inline_code_bg: Color::Rgb(240, 240, 240),
+                quote: Color::Rgb(90, 90, 90),
+                code_border: Color::Rgb(180, 180, 180),
+                code_bg: Color::Rgb(245, 245, 245),
+                table_border: Color::Rgb(150, 150, 150),
+                table_header: Color::Rgb(0, 0, 0),
             },
         }
     }
@@ -118,10 +150,10 @@ impl Theme {
     }
 }
 
-type CacheKey = (String, String, bool);
+type CacheKey = (String, String, bool, bool);
 
-/// Loads syntect defaults lazily and highlights individual diff lines.
-/// Results are cached per (extension, text, mode) so redraws stay cheap.
+/// Loads syntect defaults lazily and highlights individual lines.
+/// Results are cached per (extension, text, mode, colored) so redraws stay cheap.
 pub struct SyntaxEngine {
     set: SyntaxSet,
     themes: ThemeSet,
@@ -137,20 +169,46 @@ impl SyntaxEngine {
         }
     }
 
+    /// Grayscale highlighting for diff panes and other chrome.
     pub fn highlight(&self, text: &str, path: &str, mode: ThemeMode) -> Vec<(Style, String)> {
+        self.highlight_impl(text, path, mode, false)
+    }
+
+    /// Real terminal colors, used inside Markdown code blocks.
+    pub fn highlight_colored(
+        &self,
+        text: &str,
+        path: &str,
+        mode: ThemeMode,
+    ) -> Vec<(Style, String)> {
+        self.highlight_impl(text, path, mode, true)
+    }
+
+    fn highlight_impl(
+        &self,
+        text: &str,
+        path: &str,
+        mode: ThemeMode,
+        colored: bool,
+    ) -> Vec<(Style, String)> {
         let extension = Path::new(path)
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or("")
             .to_string();
-        let key = (extension.clone(), text.to_string(), mode == ThemeMode::Dark);
+        let key = (
+            extension.clone(),
+            text.to_string(),
+            mode == ThemeMode::Dark,
+            colored,
+        );
         if let Ok(cache) = self.cache.lock()
             && let Some(hit) = cache.get(&key)
         {
             return hit.clone();
         }
 
-        let spans = self.highlight_uncached(text, &extension, mode);
+        let spans = self.highlight_uncached(text, &extension, mode, colored);
         if let Ok(mut cache) = self.cache.lock() {
             if cache.len() > 8_192 {
                 cache.clear();
@@ -165,6 +223,7 @@ impl SyntaxEngine {
         text: &str,
         extension: &str,
         mode: ThemeMode,
+        colored: bool,
     ) -> Vec<(Style, String)> {
         let fallback = vec![(Style::default(), text.to_string())];
         let theme_name = match mode {
@@ -192,10 +251,31 @@ impl SyntaxEngine {
                     .into_iter()
                     .filter(|(_, text)| !text.is_empty())
                     .map(|(style, text)| {
-                        (
-                            Style::default().fg(mono_color(style.foreground, mode)),
-                            text.to_string(),
-                        )
+                        let color = if colored {
+                            Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b)
+                        } else {
+                            mono_color(style.foreground, mode)
+                        };
+                        let mut cell = Style::default().fg(color);
+                        if style
+                            .font_style
+                            .contains(syntect::highlighting::FontStyle::BOLD)
+                        {
+                            cell = cell.add_modifier(Modifier::BOLD);
+                        }
+                        if style
+                            .font_style
+                            .contains(syntect::highlighting::FontStyle::ITALIC)
+                        {
+                            cell = cell.add_modifier(Modifier::ITALIC);
+                        }
+                        if style
+                            .font_style
+                            .contains(syntect::highlighting::FontStyle::UNDERLINE)
+                        {
+                            cell = cell.add_modifier(Modifier::UNDERLINED);
+                        }
+                        (cell, text.to_string())
                     })
                     .collect();
                 if spans.is_empty() { fallback } else { spans }
@@ -282,6 +362,16 @@ mod tests {
                 assert_eq!(g, b);
             }
         }
+    }
+
+    #[test]
+    fn colored_syntax_highlighting_preserves_hue() {
+        let engine = SyntaxEngine::new();
+        let spans = engine.highlight_colored("fn main() {}", "a.rs", ThemeMode::Dark);
+        assert!(spans.iter().any(|(style, _)| match style.fg {
+            Some(Color::Rgb(r, g, b)) => r != g || g != b,
+            _ => false,
+        }));
     }
 
     #[test]

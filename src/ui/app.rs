@@ -2563,9 +2563,9 @@ impl App {
         };
         let inner = pane(frame, sections[0], title, focused, &self.theme);
         self.chat.viewport_height = inner.height;
-        let lines = self
-            .chat
-            .build_lines(inner.width.max(1), &self.tools, &self.theme);
+        let lines =
+            self.chat
+                .build_lines(inner.width.max(1), &self.tools, &self.theme, &self.syntax);
         frame.render_widget(
             Paragraph::new(Text::from(lines))
                 .style(self.theme.text())
